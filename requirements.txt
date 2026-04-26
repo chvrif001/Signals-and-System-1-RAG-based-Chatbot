@@ -1,15 +1,17 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+
 python-telegram-bot==21.5
 langchain
 langchain-community
 langchain-together
 langchain-text-splitters
-chromadb
-sentence-transformers
+chromadb==0.4.24
+sentence-transformers==2.7.0
 pypdf
 pillow
-transformers
-torch
-torchvision
+torch==2.2.2+cpu
+torchvision==0.17.2+cpu
+transformers==4.40.0
 matplotlib
 numpy
 sympy
