@@ -60,14 +60,24 @@ os.makedirs(PLOT_FOLDER, exist_ok=True)
 os.environ["TOGETHER_API_KEY"] = TOGETHER_API_KEY
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TrOCR — Handwriting Recognition
+# TrOCR — Handwriting Recognition (lazy-loaded to save startup RAM)
 # ══════════════════════════════════════════════════════════════════════════════
-print("Loading TrOCR model...")
-trocr_processor = TrOCRProcessor.from_pretrained("microsoft/trocr-large-handwritten")
-trocr_model     = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-large-handwritten")
+# Model is NOT loaded at startup — only when the first photo arrives.
+# This saves ~1.5GB RAM and prevents OOM crashes on Railway's free tier.
+trocr_processor = None
+trocr_model     = None
 device          = "cuda" if torch.cuda.is_available() else "cpu"
-trocr_model     = trocr_model.to(device)
-print(f"TrOCR ready on {device}")
+
+
+def _load_trocr_if_needed():
+    """Load TrOCR model on first use, then keep it in memory."""
+    global trocr_processor, trocr_model
+    if trocr_model is None:
+        print("Loading TrOCR model on first photo request...")
+        trocr_processor = TrOCRProcessor.from_pretrained("microsoft/trocr-large-handwritten")
+        trocr_model     = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-large-handwritten")
+        trocr_model     = trocr_model.to(device)
+        print(f"TrOCR ready on {device}")
 
 
 def extract_handwritten_text(image_path: str) -> str:
@@ -75,6 +85,8 @@ def extract_handwritten_text(image_path: str) -> str:
     Process full image first; fall back to horizontal strips for tall images.
     This avoids breaking equations across strip boundaries.
     """
+    _load_trocr_if_needed()
+
     img           = Image.open(image_path).convert("RGB")
     width, height = img.size
 
@@ -88,7 +100,7 @@ def extract_handwritten_text(image_path: str) -> str:
         return trocr_processor.batch_decode(ids, skip_special_tokens=True)[0].strip()
 
     # For tall images (full-page photos), use strips
-    strip_height = 120  # increased from 80 to reduce boundary breaks
+    strip_height = 120
     lines        = []
     for y in range(0, height, strip_height):
         strip        = img.crop((0, y, width, min(y + strip_height, height)))
@@ -536,4 +548,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main())main())
