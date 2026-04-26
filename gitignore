@@ -1,0 +1,32 @@
+# Environment
+.env
+
+# ChromaDB index (stored on Railway Volume, not in repo)
+chroma_db/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Temp files
+*.jpg
+*.png
+plots/
+student_images/
+
+# IDE
+.vscode/
+.idea/
+*.swp

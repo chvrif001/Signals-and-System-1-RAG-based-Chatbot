@@ -1,0 +1,16 @@
+python-telegram-bot==21.5
+langchain
+langchain-community
+langchain-together
+langchain-text-splitters
+chromadb
+sentence-transformers
+pypdf
+pillow
+transformers
+torch
+torchvision
+matplotlib
+numpy
+sympy
+nest_asyncio
