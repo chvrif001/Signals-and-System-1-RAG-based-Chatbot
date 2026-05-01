@@ -333,7 +333,7 @@ def build_chains(vs):
     retriever = vs.as_retriever(search_type="similarity", search_kwargs={"k": 3})
 
     llm = ChatTogether(
-        model="meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+        model="meta-llama/Meta-Llama-3-8B-Instruct-Lite",
         temperature=0.7,
         max_tokens=1024,
     )
