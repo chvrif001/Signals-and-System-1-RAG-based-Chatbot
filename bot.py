@@ -14,8 +14,6 @@ import numpy as np
 import sympy as sp
 
 from PIL import Image
-import torch
-from transformers import TrOCRProcessor, VisionEncoderDecoderModel
 
 from langchain_community.document_loaders import PyPDFDirectoryLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -118,8 +116,65 @@ def parse_ct_expr(text: str) -> sp.Expr:
     return sp.sympify(_normalise(text), locals=_COMMON_NS)
 
 
-def parse_dt_expr(text: str) -> sp.Expr:
-    return sp.sympify(_normalise(text), locals=_COMMON_NS)
+def _normalise_dt(expr: str) -> str:
+    """
+    Normalise a discrete-time expression.
+    Keeps bracket notation u[n-k] intact and does NOT map to Heaviside —
+    instead uses UnitStep (evaluated numerically as n >= k).
+    """
+    s = expr.strip()
+    s = s.replace("^", "**").replace("{", "(").replace("}", ")")
+    s = re.sub(r'\be\b', 'E', s)
+    # u[n-k] or u[n] → UnitStep(n-k) or UnitStep(n)
+    s = re.sub(r'\bu\s*\[([^\]]+)\]', r'UnitStep(\1)', s)
+    # delta[n-k] → KronDelta(n-k)
+    s = re.sub(r'\b(?:delta|δ)\s*\[([^\]]+)\]', r'KronDelta(\1)', s)
+    # implicit multiply: 2n → 2*n
+    s = re.sub(r'(\d)(n\b)', r'\1*\2', s)
+    return s
+
+
+def _unit_step_dt(val):
+    """Discrete unit step: u[n] = 1 for n>=0, 0 otherwise."""
+    arr = np.asarray(val, dtype=float)
+    return np.where(arr >= 0, 1.0, 0.0)
+
+
+def _kron_delta_dt(val):
+    """Kronecker delta: δ[n] = 1 for n==0, 0 otherwise."""
+    arr = np.asarray(val, dtype=float)
+    return (arr == 0).astype(float)
+
+
+def parse_dt_expr(text: str):
+    """
+    Parse a discrete-time expression and return a callable f(n_array) -> array.
+    Handles u[n-k], delta[n-k] correctly over integer n.
+    """
+    s = _normalise_dt(text)
+    # Build a safe eval namespace using numpy lambdas
+    import math
+    ns = {
+        "n":         None,          # replaced at eval time
+        "pi":        np.pi,
+        "E":         np.e,
+        "exp":       np.exp,
+        "sin":       np.sin,
+        "cos":       np.cos,
+        "sqrt":      np.sqrt,
+        "abs":       np.abs,
+        "Abs":       np.abs,
+        "UnitStep":  _unit_step_dt,
+        "KronDelta": _kron_delta_dt,
+        "log":       np.log,
+    }
+
+    def evaluator(n_array: np.ndarray) -> np.ndarray:
+        local = dict(ns)
+        local["n"] = n_array
+        return np.real(eval(s, {"__builtins__": {}}, local)).astype(float)  # noqa: S307
+
+    return evaluator
 
 
 _SIGNAL_CHARS = ['(', '[', 't', 'n', 'sin', 'cos', 'exp',
@@ -218,17 +273,10 @@ def plot_ct(expr_str: str, msg_id: int) -> str | None:
 
 def plot_dt(expr_str: str, msg_id: int) -> str | None:
     try:
-        expr  = parse_dt_expr(expr_str)
-        f_lam = sp.lambdify(
-            n_sym, expr,
-            modules=["numpy", {
-                "Heaviside":  lambda x: np.where(np.asarray(x, float) >= 0, 1., 0.),
-                "DiracDelta": lambda x: (np.asarray(x, float) == 0).astype(float),
-            }]
-        )
-        n_vals = np.arange(-10, 21)
-        y_vals = np.real(f_lam(n_vals)).astype(float)
-        y_vals = np.clip(y_vals, -10, 10)
+        evaluator = parse_dt_expr(expr_str)
+        n_vals    = np.arange(-10, 21)
+        y_vals    = evaluator(n_vals)
+        y_vals    = np.clip(y_vals, -10, 10)
     except Exception as e:
         print(f"[plot_dt] {e}"); return None
 
@@ -489,23 +537,30 @@ def _parse_two_signals(text: str):
 def _numerical_convolution_plot(f_expr: sp.Expr, g_expr: sp.Expr,
                                  msg_id: int) -> str | None:
     try:
-        t_vals = np.linspace(-5, 10, 2000)
+        # Use a one-sided time axis long enough to capture the ramp/result
+        # Starting slightly before 0 to capture pre-onset behaviour
+        t_vals = np.linspace(-2, 20, 5000)
         dt     = t_vals[1] - t_vals[0]
         f_lam  = _lambdify_ct(f_expr)
         g_lam  = _lambdify_ct(g_expr)
         f_vals = np.real(f_lam(t_vals)).astype(float)
         g_vals = np.real(g_lam(t_vals)).astype(float)
+
+        # np.convolve gives length len(f)+len(g)-1; time axis starts at 2*t_vals[0]
         conv   = np.convolve(f_vals, g_vals, mode="full") * dt
-        t_conv = np.linspace(t_vals[0] * 2, t_vals[-1] * 2, len(conv))
+        t_full = t_vals[0] + np.arange(len(conv)) * dt
+
+        # Only keep the portion within a sensible display window
+        display_mask = (t_full >= -2) & (t_full <= 20)
+        t_disp = t_full[display_mask]
+        c_disp = conv[display_mask]
 
         fig, axes = plt.subplots(3, 1, figsize=(9, 7))
         axes[0].plot(t_vals, f_vals, color="steelblue")
-        axes[0].set(title="f(t)", xlabel="t")
-        axes[0].grid(True, alpha=.3)
+        axes[0].set(title="f(t)", xlabel="t"); axes[0].grid(True, alpha=.3)
         axes[1].plot(t_vals, g_vals, color="darkorange")
-        axes[1].set(title="g(t)", xlabel="t")
-        axes[1].grid(True, alpha=.3)
-        axes[2].plot(t_conv, conv, color="green")
+        axes[1].set(title="g(t)", xlabel="t"); axes[1].grid(True, alpha=.3)
+        axes[2].plot(t_disp, c_disp, color="green")
         axes[2].set(title="(f ★ g)(t)  [numerical]", xlabel="t")
         axes[2].grid(True, alpha=.3)
         fig.tight_layout()
@@ -541,9 +596,17 @@ def compute_convolution(expr1_str: str, expr2_str: str, msg_id: int = 0):
     lines.append("   (Causal signals: limits become 0 to t)\n")
 
     plot_path = None
+    # Detect if both signals are causal (contain Heaviside / u(t))
+    both_causal = ("Heaviside" in str(f) or str(f) == str(sp.Heaviside(t_sym))) and \
+                  ("Heaviside" in str(g) or str(g) == str(sp.Heaviside(t_sym)))
+    limits = (tau, 0, t_sym) if both_causal else (tau, -sp.oo, sp.oo)
+
     try:
-        result = sp.integrate(integrand, (tau, -sp.oo, sp.oo))
+        result = sp.integrate(integrand, limits)
         result = sp.simplify(result)
+        # If result still contains an unevaluated integral, fall back
+        if result.has(sp.Integral):
+            raise ValueError("SymPy returned unevaluated integral")
         lines.append("Step 3 — Evaluate the integral:")
         lines.append(f"   (f ★ g)(t) = {sp.pretty(result)}\n")
         lines.append(f"✅  Result: (f ★ g)(t) = {sp.pretty(result)}")
@@ -688,54 +751,72 @@ async def handle_mark_session(update: Update,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TrOCR — Handwriting Recognition (lazy-loaded to save startup RAM)
+# OCR — Qwen2.5 Vision via Together AI  (no local model download needed)
+# Replaces TrOCR which requires huggingface.co access that may be blocked
+# on Railway's network.
 # ══════════════════════════════════════════════════════════════════════════════
-trocr_processor = None
-trocr_model     = None
-device          = "cuda" if torch.cuda.is_available() else "cpu"
-
-
-def _load_trocr_if_needed():
-    global trocr_processor, trocr_model
-    if trocr_model is None:
-        print("Loading TrOCR model on first photo request...")
-        trocr_processor = TrOCRProcessor.from_pretrained("microsoft/trocr-large-handwritten")
-        trocr_model     = VisionEncoderDecoderModel.from_pretrained(
-            "microsoft/trocr-large-handwritten")
-        trocr_model     = trocr_model.to(device)
-        print(f"TrOCR ready on {device}")
+def _image_to_base64(image_path: str) -> tuple[str, str]:
+    """Return (base64_string, mime_type) for a given image file."""
+    ext  = os.path.splitext(image_path)[-1].lower().lstrip(".")
+    mime = "jpeg" if ext in ("jpg", "jpeg") else ext
+    with open(image_path, "rb") as fh:
+        return base64.b64encode(fh.read()).decode("utf-8"), mime
 
 
 def extract_handwritten_text(image_path: str) -> str:
     """
-    Process full image first; fall back to horizontal strips for tall images.
+    Send the image to Qwen2.5-7B-Instruct-Turbo via Together AI's
+    vision endpoint and return the extracted handwritten text.
+    No local model download — works on Railway without HuggingFace access.
     """
-    _load_trocr_if_needed()
+    b64, mime = _image_to_base64(image_path)
 
-    img           = Image.open(image_path).convert("RGB")
-    width, height = img.size
+    payload = {
+        "model": QWEN_VISION_MODEL,
+        "max_tokens": 1024,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/{mime};base64,{b64}"},
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "Please transcribe ALL handwritten text and "
+                            "mathematical expressions in this image exactly "
+                            "as written. Preserve equations, symbols, and "
+                            "layout as closely as possible. Output only the "
+                            "transcribed content with no additional commentary."
+                        ),
+                    },
+                ],
+            }
+        ],
+    }
 
-    if height <= 400:
-        pixel_values = trocr_processor(
-            images=img, return_tensors="pt"
-        ).pixel_values.to(device)
-        with torch.no_grad():
-            ids = trocr_model.generate(pixel_values, max_new_tokens=512)
-        return trocr_processor.batch_decode(ids, skip_special_tokens=True)[0].strip()
+    headers = {
+        "Authorization": f"Bearer {TOGETHER_API_KEY}",
+        "Content-Type":  "application/json",
+    }
 
-    strip_height = 120
-    lines        = []
-    for y in range(0, height, strip_height):
-        strip        = img.crop((0, y, width, min(y + strip_height, height)))
-        pixel_values = trocr_processor(
-            images=strip, return_tensors="pt"
-        ).pixel_values.to(device)
-        with torch.no_grad():
-            ids = trocr_model.generate(pixel_values, max_new_tokens=256)
-        text = trocr_processor.batch_decode(ids, skip_special_tokens=True)[0].strip()
-        if text:
-            lines.append(text)
-    return "\n".join(lines)
+    try:
+        resp = requests.post(
+            "https://api.together.xyz/v1/chat/completions",
+            json=payload,
+            headers=headers,
+            timeout=60,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+    except requests.exceptions.RequestException as e:
+        print(f"[Qwen OCR] API error: {e}")
+        return f"❌ OCR request failed: {e}"
+    except (KeyError, IndexError) as e:
+        print(f"[Qwen OCR] Unexpected response format: {e}")
+        return "❌ OCR response could not be parsed."
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -879,6 +960,15 @@ async def send_long(update: Update, text: str):
         await update.message.reply_text(text[i:i + 4096])
 
 
+async def send_long_code(update: Update, text: str):
+    """Send math output wrapped in a monospace code block for alignment."""
+    # Telegram code blocks have a 4096 char limit; account for the 6 backtick chars
+    chunk_size = 4090
+    for i in range(0, len(text), chunk_size):
+        chunk = text[i:i + chunk_size]
+        await update.message.reply_text(f"```\n{chunk}\n```", parse_mode="Markdown")
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Hi! I'm your *Signals & Systems* tutor bot.\n\n"
@@ -955,7 +1045,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await update.message.reply_text("⏳ Computing Laplace transform…")
         result = compute_laplace(expr_str)
-        await send_long(update, result)
+        await send_long_code(update, result)
         return
 
     # ── Fourier Transform ──────────────────────────────────────────────────────
@@ -970,7 +1060,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await update.message.reply_text("⏳ Computing Fourier transform…")
         result = compute_fourier(expr_str)
-        await send_long(update, result)
+        await send_long_code(update, result)
         return
 
     # ── Fourier Series ─────────────────────────────────────────────────────────
@@ -989,7 +1079,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"⏳ Computing Fourier series for f(t)={expr_str}, T={period:.4g}…")
         result = compute_fourier_series(expr_str, period)
-        await send_long(update, result)
+        await send_long_code(update, result)
         return
 
     # ── Convolution ────────────────────────────────────────────────────────────
@@ -1004,7 +1094,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"⏳ Computing convolution of  f(t)={e1}  and  g(t)={e2}…")
         text_result, plot_path = compute_convolution(e1, e2, msg_id)
-        await send_long(update, text_result)
+        await send_long_code(update, text_result)
         if plot_path and os.path.exists(plot_path):
             await update.message.reply_photo(
                 photo=open(plot_path, "rb"),
