@@ -4,7 +4,6 @@ import nest_asyncio
 import re
 import base64
 import requests
-import shutil
 import tempfile
 
 # ── Matplotlib non-interactive backend (must be set before pyplot import) ──────
@@ -13,8 +12,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import sympy as sp
-
-import fitz  # PyMuPDF — pip install pymupdf
 
 from langchain_community.document_loaders import PyPDFDirectoryLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -704,16 +701,25 @@ def _ocr_image_bytes(image_bytes: bytes, mime: str) -> str:
 
 
 def _extract_pdf_bytes(pdf_bytes: bytes) -> str:
-    """Extract text from PDF bytes using PyMuPDF (fully in-memory)."""
+    """
+    Extract text from PDF bytes using pypdf (already installed via langchain).
+    Runs entirely in memory via a BytesIO buffer — never touches the knowledge base.
+    """
+    import io
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        from PyPDF2 import PdfReader  # older fallback name
+
     parts = []
-    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
-        for i, page in enumerate(doc, start=1):
-            text = page.get_text("text").strip()
-            if text:
-                parts.append(f"--- Page {i} ---\n{text}")
-            else:
-                parts.append(f"--- Page {i} --- [image-only page]")
-    return "\n\n".join(parts) if parts else "[No text could be extracted]"
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    for i, page in enumerate(reader.pages, start=1):
+        text = (page.extract_text() or "").strip()
+        if text:
+            parts.append(f"--- Page {i} ---\n{text}")
+        else:
+            parts.append(f"--- Page {i} --- [image-only page, no selectable text]")
+    return "\n\n".join(parts) if parts else "[No text could be extracted from this PDF]"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
