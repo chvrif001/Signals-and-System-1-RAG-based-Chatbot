@@ -1158,7 +1158,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     extracted = _ocr_image_bytes(image_bytes, "jpeg")
     await update.message.reply_text(
-        f"📝 *Extracted handwriting:*\n\n{extracted}", parse_mode="Markdown")
+        f"📝 Extracted handwriting:\n\n{extracted}")
 
     sess = session_get(chat_id)
 
