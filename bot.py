@@ -41,12 +41,13 @@ ADMIN_USER_ID     = int(os.environ.get("ADMIN_USER_ID", "0"))
 # Options:
 #   "nim/meta/llama-3.2-11b-vision-instruct"  ← faster
 #   "nim/meta/llama-3.2-90b-vision-instruct"  ← more accurate
-VISION_MODEL = "meta-llama/Llama-3.2-90B-Vision-Instruct-Turbo"
+VISION_MODEL = "meta-llama/Llama-3.2-11B-Vision-Instruct-Turbo"
 
 LLM_MODEL    = "meta-llama/Meta-Llama-3-8B-Instruct-Lite"
 
 # ── API endpoints ─────────────────────────────────────────────────────────────
 TOGETHER_ENDPOINT = "https://api.together.xyz/v1/chat/completions"
+
 
 def _get_endpoint(model: str) -> str:
     """All models, including nim/* prefixed ones, are served via Together AI."""
