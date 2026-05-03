@@ -5,6 +5,7 @@ import re
 import base64
 import requests
 import shutil
+import tempfile
 
 # ── Matplotlib non-interactive backend (must be set before pyplot import) ──────
 import matplotlib
@@ -13,7 +14,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import sympy as sp
 
-from PIL import Image
+import fitz  # PyMuPDF — pip install pymupdf
 
 from langchain_community.document_loaders import PyPDFDirectoryLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -23,7 +24,7 @@ from langchain_together import ChatTogether
 from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
-from sentence_transformers import SentenceTransformer, util
+from sentence_transformers import SentenceTransformer
 
 from telegram import Update
 from telegram.ext import (
@@ -33,58 +34,73 @@ from telegram.ext import (
 nest_asyncio.apply()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CONFIGURATION — all secrets come from environment variables
+# CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_TOKEN        = os.environ["BOT_TOKEN"]
-TOGETHER_API_KEY = os.environ["TOGETHER_API_KEY"]
-ADMIN_USER_ID    = int(os.environ.get("ADMIN_USER_ID", "0"))
-QWEN_VISION_MODEL = "Qwen/Qwen2.5-7B-Instruct-Turbo"   # used for optional vision OCR fallback
+BOT_TOKEN         = os.environ["BOT_TOKEN"]
+TOGETHER_API_KEY  = os.environ["TOGETHER_API_KEY"]
+ADMIN_USER_ID     = int(os.environ.get("ADMIN_USER_ID", "0"))
+QWEN_VISION_MODEL = "Qwen/Qwen2.5-7B-Instruct-Turbo"
+LLM_MODEL         = "meta-llama/Meta-Llama-3-8B-Instruct-Lite"
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-PDF_FOLDER  = "./knowledge_base"
-CHROMA_DIR  = os.environ.get("CHROMA_DIR", "/data/chroma_db")
-IMG_FOLDER  = "/tmp/student_images"
+PDF_FOLDER  = "./knowledge_base"   # read-only after startup
+CHROMA_DIR  = os.environ.get("CHROMA_DIR", "/data/chroma_db")  # read-only after startup
 PLOT_FOLDER = "/tmp/plots"
 
 os.makedirs(PDF_FOLDER,  exist_ok=True)
 os.makedirs(CHROMA_DIR,  exist_ok=True)
-os.makedirs(IMG_FOLDER,  exist_ok=True)
 os.makedirs(PLOT_FOLDER, exist_ok=True)
 
 os.environ["TOGETHER_API_KEY"] = TOGETHER_API_KEY
 
 # ══════════════════════════════════════════════════════════════════════════════
+# SESSION STORE  — in-memory, per chat_id, never touches the knowledge base
+# ══════════════════════════════════════════════════════════════════════════════
+# Structure: { chat_id: {"text": str, "source": str} }
+_session_store: dict[int, dict] = {}
+
+
+def session_store(chat_id: int, text: str, source: str) -> None:
+    _session_store[chat_id] = {"text": text, "source": source}
+
+
+def session_get(chat_id: int) -> dict | None:
+    return _session_store.get(chat_id)
+
+
+def session_clear(chat_id: int) -> None:
+    _session_store.pop(chat_id, None)
+
+
+def session_has(chat_id: int) -> bool:
+    return chat_id in _session_store
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # SYMPY SYMBOLS
 # ══════════════════════════════════════════════════════════════════════════════
-t_sym  = sp.Symbol("t",     real=True)
-s_sym  = sp.Symbol("s",     complex=True)
-w_sym  = sp.Symbol("omega", real=True)
-n_sym  = sp.Symbol("n",     integer=True)
-tau    = sp.Symbol("tau",   real=True)
-a_sym  = sp.Symbol("a",     positive=True)
+t_sym = sp.Symbol("t",     real=True)
+s_sym = sp.Symbol("s",     complex=True)
+w_sym = sp.Symbol("omega", real=True)
+n_sym = sp.Symbol("n",     integer=True)
+tau   = sp.Symbol("tau",   real=True)
+a_sym = sp.Symbol("a",     positive=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ROBUST SIGNAL PARSER  (ported from Colab version)
+# SIGNAL PARSER
 # ══════════════════════════════════════════════════════════════════════════════
 def _normalise(expr: str) -> str:
-    """Clean up student shorthand before SymPy parsing."""
     s = expr.strip()
     s = s.replace("^", "**").replace("{", "(").replace("}", ")")
-
     s = re.sub(r'\bE\*\*(-[^\s\*\+\-\(\),]+)', r'E**(\1)', s)
     s = re.sub(r'\be\*\*(-[^\s\*\+\-\(\),]+)', r'E**(\1)', s)
-
     s = re.sub(r'(\d)(t\b)',               r'\1*\2', s)
     s = re.sub(r'(\d)(sin|cos|exp|sqrt)',  r'\1*\2', s)
     s = re.sub(r'(\d)\s*[eE]\*\*',        r'\1*E**', s)
-
     s = re.sub(r'\be\b', 'E', s)
-
     s = re.sub(r'\bu\s*[\(\[]', 'Heaviside(', s)
     s = re.sub(r'\]', ')', s)
-
     s = re.sub(r'\b(?:delta|δ)\s*[\(\[]', 'DiracDelta(', s)
-
     s = re.sub(
         r'\bsinc\(([^)]+)\)',
         lambda m: f'(sin(pi*({m.group(1)})))/(pi*({m.group(1)}))',
@@ -94,21 +110,11 @@ def _normalise(expr: str) -> str:
 
 
 _COMMON_NS = {
-    "t":          t_sym,
-    "s":          s_sym,
-    "omega":      w_sym,
-    "n":          n_sym,
-    "pi":         sp.pi,
-    "E":          sp.E,
-    "j":          sp.I,
-    "Heaviside":  sp.Heaviside,
-    "DiracDelta": sp.DiracDelta,
-    "exp":        sp.exp,
-    "sin":        sp.sin,
-    "cos":        sp.cos,
-    "sqrt":       sp.sqrt,
-    "Abs":        sp.Abs,
-    "log":        sp.log,
+    "t": t_sym, "s": s_sym, "omega": w_sym, "n": n_sym,
+    "pi": sp.pi, "E": sp.E, "j": sp.I,
+    "Heaviside": sp.Heaviside, "DiracDelta": sp.DiracDelta,
+    "exp": sp.exp, "sin": sp.sin, "cos": sp.cos,
+    "sqrt": sp.sqrt, "Abs": sp.Abs, "log": sp.log,
 }
 
 
@@ -117,56 +123,32 @@ def parse_ct_expr(text: str) -> sp.Expr:
 
 
 def _normalise_dt(expr: str) -> str:
-    """
-    Normalise a discrete-time expression.
-    Keeps bracket notation u[n-k] intact and does NOT map to Heaviside —
-    instead uses UnitStep (evaluated numerically as n >= k).
-    """
     s = expr.strip()
     s = s.replace("^", "**").replace("{", "(").replace("}", ")")
     s = re.sub(r'\be\b', 'E', s)
-    # u[n-k] or u[n] → UnitStep(n-k) or UnitStep(n)
     s = re.sub(r'\bu\s*\[([^\]]+)\]', r'UnitStep(\1)', s)
-    # delta[n-k] → KronDelta(n-k)
     s = re.sub(r'\b(?:delta|δ)\s*\[([^\]]+)\]', r'KronDelta(\1)', s)
-    # implicit multiply: 2n → 2*n
     s = re.sub(r'(\d)(n\b)', r'\1*\2', s)
     return s
 
 
 def _unit_step_dt(val):
-    """Discrete unit step: u[n] = 1 for n>=0, 0 otherwise."""
     arr = np.asarray(val, dtype=float)
     return np.where(arr >= 0, 1.0, 0.0)
 
 
 def _kron_delta_dt(val):
-    """Kronecker delta: δ[n] = 1 for n==0, 0 otherwise."""
     arr = np.asarray(val, dtype=float)
     return (arr == 0).astype(float)
 
 
 def parse_dt_expr(text: str):
-    """
-    Parse a discrete-time expression and return a callable f(n_array) -> array.
-    Handles u[n-k], delta[n-k] correctly over integer n.
-    """
     s = _normalise_dt(text)
-    # Build a safe eval namespace using numpy lambdas
-    import math
     ns = {
-        "n":         None,          # replaced at eval time
-        "pi":        np.pi,
-        "E":         np.e,
-        "exp":       np.exp,
-        "sin":       np.sin,
-        "cos":       np.cos,
-        "sqrt":      np.sqrt,
-        "abs":       np.abs,
-        "Abs":       np.abs,
-        "UnitStep":  _unit_step_dt,
-        "KronDelta": _kron_delta_dt,
-        "log":       np.log,
+        "n": None, "pi": np.pi, "E": np.e,
+        "exp": np.exp, "sin": np.sin, "cos": np.cos,
+        "sqrt": np.sqrt, "abs": np.abs, "Abs": np.abs,
+        "UnitStep": _unit_step_dt, "KronDelta": _kron_delta_dt, "log": np.log,
     }
 
     def evaluator(n_array: np.ndarray) -> np.ndarray:
@@ -182,32 +164,18 @@ _SIGNAL_CHARS = ['(', '[', 't', 'n', 'sin', 'cos', 'exp',
                  'Heaviside', 'DiracDelta']
 
 _QUESTION_PREFIX = re.compile(
-    r'^(?:'
-    r'what\s+is\s+(?:the\s+)?|'
-    r'what\'s\s+(?:the\s+)?|'
-    r'find\s+(?:the\s+)?|'
-    r'compute\s+(?:the\s+)?|'
-    r'calculate\s+(?:the\s+)?|'
-    r'determine\s+(?:the\s+)?|'
-    r'give\s+me\s+(?:the\s+)?|'
-    r'show\s+me\s+(?:the\s+)?'
-    r')',
+    r'^(?:what\s+is\s+(?:the\s+)?|what\'s\s+(?:the\s+)?|find\s+(?:the\s+)?|'
+    r'compute\s+(?:the\s+)?|calculate\s+(?:the\s+)?|determine\s+(?:the\s+)?|'
+    r'give\s+me\s+(?:the\s+)?|show\s+me\s+(?:the\s+)?)',
     re.IGNORECASE
 )
 
 _VERB_PREFIX = re.compile(
-    r'^(?:'
-    r'plot|draw|graph|sketch|visualis[ae]|diagram|'
-    r'laplace\s+(?:transform\s+)?(?:of\s+)?|'
-    r'(?:inverse\s+)?laplace\s+(?:of\s+)?|'
-    r'fourier\s+(?:transform\s+)?(?:of\s+)?|'
-    r'(?:inverse\s+)?fourier\s+(?:of\s+)?|'
-    r'(?:i)?ft\s+(?:of\s+)?|'
-    r'f\.?t\.?\s+(?:of\s+)?|'
-    r'fourier\s+series\s+(?:of\s+)?|'
-    r'convolve\s+|convolution\s+(?:of\s+)?|'
-    r'compute\s+|calculate\s+|find\s+'
-    r')',
+    r'^(?:plot|draw|graph|sketch|visualis[ae]|diagram|'
+    r'laplace\s+(?:transform\s+)?(?:of\s+)?|(?:inverse\s+)?laplace\s+(?:of\s+)?|'
+    r'fourier\s+(?:transform\s+)?(?:of\s+)?|(?:inverse\s+)?fourier\s+(?:of\s+)?|'
+    r'(?:i)?ft\s+(?:of\s+)?|f\.?t\.?\s+(?:of\s+)?|fourier\s+series\s+(?:of\s+)?|'
+    r'convolve\s+|convolution\s+(?:of\s+)?|compute\s+|calculate\s+|find\s+)',
     re.IGNORECASE
 )
 
@@ -217,7 +185,6 @@ def extract_expr(question: str) -> str | None:
     q = _QUESTION_PREFIX.sub('', q).strip()
     q = _VERB_PREFIX.sub('', q).strip()
     q = q.rstrip("?.")
-
     if any(c in q for c in _SIGNAL_CHARS):
         return q
     if re.match(r'^-?[\d][\d\.]*$', q.strip()):
@@ -228,7 +195,7 @@ def extract_expr(question: str) -> str | None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SIGNAL PLOTTER  (continuous + discrete)
+# SIGNAL PLOTTER
 # ══════════════════════════════════════════════════════════════════════════════
 PLOT_KEYWORDS     = ["plot", "draw", "graph", "sketch", "show me",
                      "visualise", "visualize", "diagram"]
@@ -257,7 +224,6 @@ def plot_ct(expr_str: str, msg_id: int) -> str | None:
         y_vals = np.clip(y_vals, -10, 10)
     except Exception as e:
         print(f"[plot_ct] {e}"); return None
-
     fig, ax = plt.subplots(figsize=(8, 3))
     ax.plot(t_vals, y_vals, color="steelblue", lw=2)
     ax.axhline(0, color="k", lw=.6)
@@ -279,7 +245,6 @@ def plot_dt(expr_str: str, msg_id: int) -> str | None:
         y_vals    = np.clip(y_vals, -10, 10)
     except Exception as e:
         print(f"[plot_dt] {e}"); return None
-
     fig, ax = plt.subplots(figsize=(10, 3))
     ml, sl, _ = ax.stem(n_vals, y_vals, linefmt="steelblue",
                          markerfmt="o", basefmt="k-")
@@ -319,18 +284,16 @@ def generate_plot(question: str, msg_id: int) -> str | None:
         expr_str = extract_expr(question)
         if expr_str:
             return plot_dt(expr_str, msg_id)
-
     if "dirac" in q or ("delta" in q and "[n]" not in q):
         m  = re.search(r'(?:delta|δ)\s*\(\s*t\s*([+-]\s*\d*\.?\d+)?\s*\)', question)
         t0 = float(m.group(1).replace(" ", "")) if (m and m.group(1)) else 0.0
         return plot_dirac_arrow(t0, msg_id)
-
     expr_str = extract_expr(question)
     return plot_ct(expr_str, msg_id) if expr_str else None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LAPLACE TRANSFORM WITH STEPS
+# LAPLACE TRANSFORM
 # ══════════════════════════════════════════════════════════════════════════════
 def _identify_laplace_rule(expr: sp.Expr) -> str:
     s = str(expr)
@@ -355,16 +318,13 @@ def compute_laplace(expr_str: str) -> str:
     lines = ["━━━ 📐 LAPLACE TRANSFORM ━━━\n"]
     lines.append(f"Input:  f(t) = {expr_str}\n")
     lines.append("Definition:  F(s) = ∫₀^∞  f(t) · e^(-st) dt\n")
-
     try:
         f = parse_ct_expr(expr_str)
     except Exception as e:
         return (f"❌ Could not parse expression: {e}\n"
                 f"Try: e**(-2*t)*Heaviside(t)  or  sin(3*t)*u(t)")
-
     rule = _identify_laplace_rule(f)
     lines.append(f"Step 1 — Recognise the signal form:\n   → {rule}\n")
-
     args = sp.Add.make_args(f)
     if len(args) > 1:
         lines.append("Step 2 — Apply linearity  L{af + bg} = aF(s) + bG(s):")
@@ -377,7 +337,6 @@ def compute_laplace(expr_str: str) -> str:
         lines.append("")
     else:
         lines.append("Step 2 — Single term, applying transform directly.\n")
-
     try:
         result = sp.laplace_transform(f, t_sym, s_sym, noconds=True)
         result = sp.simplify(result)
@@ -390,12 +349,11 @@ def compute_laplace(expr_str: str) -> str:
     except Exception as e:
         lines.append(f"❌ SymPy could not find a closed form: {e}")
         lines.append("   Try splitting the expression or simplifying first.")
-
     return "\n".join(lines)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FOURIER TRANSFORM WITH STEPS
+# FOURIER TRANSFORM
 # ══════════════════════════════════════════════════════════════════════════════
 def _identify_fourier_rule(expr: sp.Expr) -> str:
     s = str(expr)
@@ -418,16 +376,13 @@ def compute_fourier(expr_str: str) -> str:
     lines = ["━━━ 📡 FOURIER TRANSFORM ━━━\n"]
     lines.append(f"Input:  f(t) = {expr_str}\n")
     lines.append("Definition:  F(ω) = ∫₋∞^∞  f(t) · e^(-jωt) dt\n")
-
     try:
         f = parse_ct_expr(expr_str)
     except Exception as e:
         return (f"❌ Could not parse expression: {e}\n"
                 f"Try: e**(-t)*u(t)  or  cos(2*t)*u(t)")
-
     rule = _identify_fourier_rule(f)
     lines.append(f"Step 1 — Recognise the signal form:\n   → {rule}\n")
-
     args = sp.Add.make_args(f)
     if len(args) > 1:
         lines.append("Step 2 — Apply linearity  F{af + bg} = aF(ω) + bG(ω):")
@@ -440,7 +395,6 @@ def compute_fourier(expr_str: str) -> str:
         lines.append("")
     else:
         lines.append("Step 2 — Single term, applying transform directly.\n")
-
     try:
         result = sp.fourier_transform(f, t_sym, w_sym / (2 * sp.pi), noconds=True)
         result = sp.simplify(result)
@@ -451,12 +405,11 @@ def compute_fourier(expr_str: str) -> str:
     except Exception as e:
         lines.append(f"❌ SymPy could not evaluate: {e}")
         lines.append("   Tip: make sure causal signals include u(t) / Heaviside(t)")
-
     return "\n".join(lines)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FOURIER SERIES WITH STEPS
+# FOURIER SERIES
 # ══════════════════════════════════════════════════════════════════════════════
 def _extract_period(text: str) -> float | None:
     m = re.search(r'[Tt]\s*=\s*([0-9.]+\s*\*?\s*pi|[0-9.]+)', text)
@@ -473,27 +426,22 @@ def compute_fourier_series(expr_str: str, period: float, n_terms: int = 5) -> st
     lines = ["━━━ 🎵 FOURIER SERIES ━━━\n"]
     lines.append(f"Input:   f(t) = {expr_str}")
     lines.append(f"Period:  T = {period:.4g}\n")
-
     try:
         f = parse_ct_expr(expr_str)
     except Exception as e:
         return f"❌ Could not parse expression: {e}"
-
     T  = sp.Rational(period).limit_denominator(1000)
     w0 = 2 * sp.pi / T
-
     lines.append(f"Step 1 — Fundamental frequency:\n   ω₀ = 2π/T = {sp.pretty(w0)} rad/s\n")
     lines.append("Step 2 — Coefficient formulas:")
     lines.append("   a₀ = (1/T) ∫₀ᵀ f(t) dt")
     lines.append("   aₙ = (2/T) ∫₀ᵀ f(t)·cos(nω₀t) dt")
     lines.append("   bₙ = (2/T) ∫₀ᵀ f(t)·sin(nω₀t) dt\n")
-
     try:
         a0 = sp.simplify(sp.integrate(f, (t_sym, 0, T)) / T)
         lines.append(f"Step 3 — DC coefficient:\n   a₀ = {sp.pretty(a0)}\n")
     except Exception:
         lines.append("Step 3 — a₀ could not be computed symbolically.\n")
-
     lines.append(f"Step 4 — First {n_terms} harmonics:")
     for k in range(1, n_terms + 1):
         try:
@@ -504,7 +452,6 @@ def compute_fourier_series(expr_str: str, period: float, n_terms: int = 5) -> st
             lines.append(f"   n={k}:  a_{k} = {sp.pretty(an)},   b_{k} = {sp.pretty(bn)}")
         except Exception:
             lines.append(f"   n={k}:  could not evaluate")
-
     try:
         series = sp.fourier_series(f, (t_sym, 0, T))
         trunc  = series.truncate(n_terms)
@@ -513,12 +460,11 @@ def compute_fourier_series(expr_str: str, period: float, n_terms: int = 5) -> st
         lines.append(f"\n✅  Series computed successfully.")
     except Exception as e:
         lines.append(f"\n⚠️  Full series truncation failed: {e}")
-
     return "\n".join(lines)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CONVOLUTION WITH STEPS
+# CONVOLUTION
 # ══════════════════════════════════════════════════════════════════════════════
 def _parse_two_signals(text: str):
     m = re.split(r'\bwith\b|\band\b|\*|\bstar\b', text, maxsplit=1,
@@ -537,30 +483,21 @@ def _parse_two_signals(text: str):
 def _numerical_convolution_plot(f_expr: sp.Expr, g_expr: sp.Expr,
                                  msg_id: int) -> str | None:
     try:
-        # Use a one-sided time axis long enough to capture the ramp/result
-        # Starting slightly before 0 to capture pre-onset behaviour
         t_vals = np.linspace(-2, 20, 5000)
         dt     = t_vals[1] - t_vals[0]
         f_lam  = _lambdify_ct(f_expr)
         g_lam  = _lambdify_ct(g_expr)
         f_vals = np.real(f_lam(t_vals)).astype(float)
         g_vals = np.real(g_lam(t_vals)).astype(float)
-
-        # np.convolve gives length len(f)+len(g)-1; time axis starts at 2*t_vals[0]
         conv   = np.convolve(f_vals, g_vals, mode="full") * dt
         t_full = t_vals[0] + np.arange(len(conv)) * dt
-
-        # Only keep the portion within a sensible display window
-        display_mask = (t_full >= -2) & (t_full <= 20)
-        t_disp = t_full[display_mask]
-        c_disp = conv[display_mask]
-
+        mask   = (t_full >= -2) & (t_full <= 20)
         fig, axes = plt.subplots(3, 1, figsize=(9, 7))
         axes[0].plot(t_vals, f_vals, color="steelblue")
         axes[0].set(title="f(t)", xlabel="t"); axes[0].grid(True, alpha=.3)
         axes[1].plot(t_vals, g_vals, color="darkorange")
         axes[1].set(title="g(t)", xlabel="t"); axes[1].grid(True, alpha=.3)
-        axes[2].plot(t_disp, c_disp, color="green")
+        axes[2].plot(t_full[mask], conv[mask], color="green")
         axes[2].set(title="(f ★ g)(t)  [numerical]", xlabel="t")
         axes[2].grid(True, alpha=.3)
         fig.tight_layout()
@@ -578,13 +515,11 @@ def compute_convolution(expr1_str: str, expr2_str: str, msg_id: int = 0):
     lines.append(f"f(t) = {expr1_str}")
     lines.append(f"g(t) = {expr2_str}\n")
     lines.append("Definition:  (f ★ g)(t) = ∫₋∞^∞  f(τ) · g(t−τ) dτ\n")
-
     try:
         f = parse_ct_expr(expr1_str)
         g = parse_ct_expr(expr2_str)
     except Exception as e:
         return f"❌ Could not parse one or both signals: {e}", None
-
     lines.append("Step 1 — Substitute τ into f(t) and (t−τ) into g(t):")
     f_tau     = f.subs(t_sym, tau)
     g_shift   = g.subs(t_sym, t_sym - tau)
@@ -594,17 +529,13 @@ def compute_convolution(expr1_str: str, expr2_str: str, msg_id: int = 0):
     lines.append(f"   Integrand = {sp.pretty(integrand)}\n")
     lines.append("Step 2 — Determine integration limits from signal support:")
     lines.append("   (Causal signals: limits become 0 to t)\n")
-
-    plot_path = None
-    # Detect if both signals are causal (contain Heaviside / u(t))
+    plot_path   = None
     both_causal = ("Heaviside" in str(f) or str(f) == str(sp.Heaviside(t_sym))) and \
                   ("Heaviside" in str(g) or str(g) == str(sp.Heaviside(t_sym)))
     limits = (tau, 0, t_sym) if both_causal else (tau, -sp.oo, sp.oo)
-
     try:
         result = sp.integrate(integrand, limits)
         result = sp.simplify(result)
-        # If result still contains an unevaluated integral, fall back
         if result.has(sp.Integral):
             raise ValueError("SymPy returned unevaluated integral")
         lines.append("Step 3 — Evaluate the integral:")
@@ -621,7 +552,6 @@ def compute_convolution(expr1_str: str, expr2_str: str, msg_id: int = 0):
             lines.append("📊  Numerical (f ★ g)(t) plotted successfully.")
         else:
             lines.append("❌  Numerical fallback also failed. Check the expressions.")
-
     return "\n".join(lines), plot_path
 
 
@@ -630,29 +560,18 @@ def compute_convolution(expr1_str: str, expr2_str: str, msg_id: int = 0):
 # ══════════════════════════════════════════════════════════════════════════════
 LAPLACE_KEYS = ["laplace", "l transform", "l{", "laplace transform",
                 "laplace of", "inverse laplace"]
-
 FOURIER_KEYS = ["fourier transform", "ft{", "fourier of", "f transform",
                 "ft of", "compute ft", "find ft", "f.t. of", "fourier tf",
                 "inverse fourier"]
-
 FS_KEYS   = ["fourier series", "periodic signal", "series of"]
 CONV_KEYS = ["convolution", "convolve", "f*g", "f★g", "f star g"]
 
 
-def is_laplace(q: str) -> bool:
-    return any(k in q for k in LAPLACE_KEYS)
-
-def is_fourier(q: str) -> bool:
-    return any(k in q for k in FOURIER_KEYS)
-
-def is_fs(q: str) -> bool:
-    return any(k in q for k in FS_KEYS)
-
-def is_conv(q: str) -> bool:
-    return any(k in q for k in CONV_KEYS)
-
-def is_plot(q: str) -> bool:
-    return any(k in q for k in PLOT_KEYWORDS)
+def is_laplace(q: str) -> bool: return any(k in q for k in LAPLACE_KEYS)
+def is_fourier(q: str) -> bool: return any(k in q for k in FOURIER_KEYS)
+def is_fs(q: str)      -> bool: return any(k in q for k in FS_KEYS)
+def is_conv(q: str)    -> bool: return any(k in q for k in CONV_KEYS)
+def is_plot(q: str)    -> bool: return any(k in q for k in PLOT_KEYWORDS)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -661,8 +580,7 @@ def is_plot(q: str) -> bool:
 WEIGHTS      = {"tutorials": .10, "labs": .10, "tests": .20, "exam": .60}
 PASS_MARK    = 50.0
 TRIGGER_KEYS = ["pass", "exam mark", "calculate marks", "how much do i need",
-                "calculate mark breakdown", "what do i need", "minimum",
-                "final mark"]
+                "calculate mark breakdown", "what do i need", "minimum", "final mark"]
 STEPS_MC     = ["test1", "test2", "labs", "tutorials"]
 STEP_PROMPTS = {
     "test1":     "What did you get for *Test 1*? (0–100)",
@@ -679,9 +597,9 @@ def is_mark_trigger(text: str) -> bool:
 
 def compute_result(data: dict) -> str:
     test_avg = (data["test1"] + data["test2"]) / 2
-    weighted = (test_avg            * WEIGHTS["tests"] +
-                data["labs"]        * WEIGHTS["labs"]  +
-                data["tutorials"]   * WEIGHTS["tutorials"])
+    weighted = (test_avg          * WEIGHTS["tests"] +
+                data["labs"]      * WEIGHTS["labs"]  +
+                data["tutorials"] * WEIGHTS["tutorials"])
     req_exam = (PASS_MARK - weighted) / WEIGHTS["exam"]
     lines = [
         "📊 *Your Mark Breakdown*\n",
@@ -711,14 +629,12 @@ async def handle_mark_session(update: Update,
                                context: ContextTypes.DEFAULT_TYPE) -> bool:
     chat_id = update.effective_chat.id
     text    = update.message.text.strip()
-
     if is_mark_trigger(text) and chat_id not in mark_sessions:
         mark_sessions[chat_id] = {"step": "test1", "data": {}}
         await update.message.reply_text(
             "Let's calculate what you need to pass!\n\n" + STEP_PROMPTS["test1"],
             parse_mode="Markdown")
         return True
-
     if chat_id in mark_sessions:
         session = mark_sessions[chat_id]
         step    = session["step"]
@@ -732,14 +648,12 @@ async def handle_mark_session(update: Update,
                 raise ValueError
         except ValueError:
             await update.message.reply_text(
-                "⚠️ Enter a number 0–100, or type *cancel*.",
-                parse_mode="Markdown")
+                "⚠️ Enter a number 0–100, or type *cancel*.", parse_mode="Markdown")
             return True
-
         session["data"][step] = value
         idx = STEPS_MC.index(step)
         if idx + 1 < len(STEPS_MC):
-            nxt            = STEPS_MC[idx + 1]
+            nxt             = STEPS_MC[idx + 1]
             session["step"] = nxt
             await update.message.reply_text(STEP_PROMPTS[nxt], parse_mode="Markdown")
         else:
@@ -751,83 +665,148 @@ async def handle_mark_session(update: Update,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# OCR — Qwen2.5 Vision via Together AI  (no local model download needed)
-# Replaces TrOCR which requires huggingface.co access that may be blocked
-# on Railway's network.
+# OCR — Qwen2.5 Vision via Together AI
 # ══════════════════════════════════════════════════════════════════════════════
-def _image_to_base64(image_path: str) -> tuple[str, str]:
-    """Return (base64_string, mime_type) for a given image file."""
-    ext  = os.path.splitext(image_path)[-1].lower().lstrip(".")
-    mime = "jpeg" if ext in ("jpg", "jpeg") else ext
-    with open(image_path, "rb") as fh:
-        return base64.b64encode(fh.read()).decode("utf-8"), mime
-
-
-def extract_handwritten_text(image_path: str) -> str:
-    """
-    Send the image to Qwen2.5-7B-Instruct-Turbo via Together AI's
-    vision endpoint and return the extracted handwritten text.
-    No local model download — works on Railway without HuggingFace access.
-    """
-    b64, mime = _image_to_base64(image_path)
-
+def _ocr_image_bytes(image_bytes: bytes, mime: str) -> str:
+    """Send image bytes to Qwen Vision and return extracted text."""
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
     payload = {
         "model": QWEN_VISION_MODEL,
-        "max_tokens": 1024,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/{mime};base64,{b64}"},
-                    },
-                    {
-                        "type": "text",
-                        "text": (
-                            "Please transcribe ALL handwritten text and "
-                            "mathematical expressions in this image exactly "
-                            "as written. Preserve equations, symbols, and "
-                            "layout as closely as possible. Output only the "
-                            "transcribed content with no additional commentary."
-                        ),
-                    },
-                ],
-            }
-        ],
+        "max_tokens": 2048,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image_url",
+                 "image_url": {"url": f"data:image/{mime};base64,{b64}"}},
+                {"type": "text",
+                 "text": (
+                     "Transcribe ALL text and mathematical expressions in this image "
+                     "exactly as written. Preserve equations, symbols, numbering, and "
+                     "layout as closely as possible. Output only the transcribed content."
+                 )},
+            ],
+        }],
     }
-
     headers = {
         "Authorization": f"Bearer {TOGETHER_API_KEY}",
         "Content-Type":  "application/json",
     }
-
     try:
         resp = requests.post(
             "https://api.together.xyz/v1/chat/completions",
-            json=payload,
-            headers=headers,
-            timeout=60,
-        )
+            json=payload, headers=headers, timeout=60)
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"].strip()
     except requests.exceptions.RequestException as e:
-        print(f"[Qwen OCR] API error: {e}")
         return f"❌ OCR request failed: {e}"
     except (KeyError, IndexError) as e:
-        print(f"[Qwen OCR] Unexpected response format: {e}")
-        return "❌ OCR response could not be parsed."
+        return f"❌ OCR response could not be parsed: {e}"
+
+
+def _extract_pdf_bytes(pdf_bytes: bytes) -> str:
+    """Extract text from PDF bytes using PyMuPDF (fully in-memory)."""
+    parts = []
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+        for i, page in enumerate(doc, start=1):
+            text = page.get_text("text").strip()
+            if text:
+                parts.append(f"--- Page {i} ---\n{text}")
+            else:
+                parts.append(f"--- Page {i} --- [image-only page]")
+    return "\n\n".join(parts) if parts else "[No text could be extracted]"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# VECTOR STORE
+# SESSION-AWARE LLM CALLS  (uploaded content = primary source of truth)
+# ══════════════════════════════════════════════════════════════════════════════
+_SESSION_RULES = """IMPORTANT — follow strictly:
+1. The uploaded document is the PRIMARY and authoritative source of truth.
+2. Use your general Signals & Systems knowledge ONLY to explain or clarify —
+   never to contradict, override, or replace the uploaded content.
+3. For correctness, marking, and solution verification rely exclusively on
+   the uploaded document.
+4. If OCR output looks garbled in a critical spot, say so and give your best
+   interpretation — do not silently substitute your own answer."""
+
+
+def _prompt_solve(doc_text: str, instruction: str) -> str:
+    return (
+        f"{_SESSION_RULES}\n\n"
+        f"Uploaded document:\n\"\"\"\n{doc_text}\n\"\"\"\n\n"
+        f"Student instruction: {instruction}\n\n"
+        f"Respond directly. Use numbered steps where maths is involved. "
+        f"Explain every formula and symbol."
+    )
+
+
+def _prompt_mark(memo_text: str, student_work: str) -> str:
+    return (
+        f"{_SESSION_RULES}\n\n"
+        f"Memo / expected solution (from uploaded file):\n\"\"\"\n{memo_text}\n\"\"\"\n\n"
+        f"Student's work (OCR extracted):\n\"\"\"\n{student_work}\n\"\"\"\n\n"
+        f"Your task:\n"
+        f"1. State CORRECT, PARTIALLY CORRECT, or INCORRECT.\n"
+        f"2. Identify every error or missing step clearly.\n"
+        f"3. Explain the correct approach for each error.\n"
+        f"4. Acknowledge what the student did right.\n"
+        f"Be encouraging and specific."
+    )
+
+
+def _prompt_explain(doc_text: str, question: str) -> str:
+    return (
+        f"{_SESSION_RULES}\n\n"
+        f"Uploaded document:\n\"\"\"\n{doc_text}\n\"\"\"\n\n"
+        f"Student question: {question}\n\n"
+        f"Classify your answer silently:\n"
+        f"  FACTUAL     → 2–4 sentences.\n"
+        f"  CONCEPTUAL  → short paragraph + one example.\n"
+        f"  CALCULATION → numbered steps, explain every symbol.\n"
+        f"Answer based on the uploaded document. Use general knowledge only to aid clarity."
+    )
+
+
+def _call_llm(prompt: str, max_tokens: int = 1500) -> str:
+    """Direct Together AI call — independent of the RAG chain."""
+    payload = {
+        "model": LLM_MODEL,
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    headers = {
+        "Authorization": f"Bearer {TOGETHER_API_KEY}",
+        "Content-Type":  "application/json",
+    }
+    try:
+        resp = requests.post(
+            "https://api.together.xyz/v1/chat/completions",
+            json=payload, headers=headers, timeout=90)
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        return f"❌ LLM call failed: {e}"
+
+
+def _route_session_prompt(doc_text: str, instruction: str) -> str:
+    """Pick the right prompt template based on the instruction keywords."""
+    instr_lower = instruction.lower()
+    if any(kw in instr_lower for kw in ["mark", "check", "compare", "correct",
+                                          "feedback", "evaluate", "grade"]):
+        return _prompt_mark(doc_text, instruction)
+    if any(kw in instr_lower for kw in ["solve", "calculate", "find", "compute",
+                                          "work out", "answer", "determine"]):
+        return _prompt_solve(doc_text, instruction)
+    return _prompt_explain(doc_text, instruction)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VECTOR STORE  (read-only after startup)
 # ══════════════════════════════════════════════════════════════════════════════
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
 
 def build_vector_store_if_needed(pdf_folder: str, chroma_dir: str):
     embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
-
     if os.path.exists(chroma_dir) and os.listdir(chroma_dir):
         print("✅ Loading existing ChromaDB from volume...")
         vs    = Chroma(persist_directory=chroma_dir, embedding_function=embeddings)
@@ -836,13 +815,11 @@ def build_vector_store_if_needed(pdf_folder: str, chroma_dir: str):
         if count > 0:
             return vs
         print("   Index was empty — rebuilding...")
-
     print("📄 Building ChromaDB from PDFs in knowledge_base/...")
     pdf_files = [f for f in os.listdir(pdf_folder) if f.endswith(".pdf")]
     if not pdf_files:
         print("⚠️  No PDFs found — bot will answer without context.")
         return None
-
     loader   = PyPDFDirectoryLoader(pdf_folder)
     docs     = loader.load()
     splitter = RecursiveCharacterTextSplitter(
@@ -851,7 +828,6 @@ def build_vector_store_if_needed(pdf_folder: str, chroma_dir: str):
     )
     chunks = splitter.split_documents(docs)
     print(f"   {len(docs)} pages → {len(chunks)} chunks")
-
     vs = Chroma.from_documents(chunks, embedding=embeddings,
                                persist_directory=chroma_dir)
     vs.persist()
@@ -860,7 +836,7 @@ def build_vector_store_if_needed(pdf_folder: str, chroma_dir: str):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# RAG CHAINS
+# RAG CHAINS  (used only for general Q&A against the permanent knowledge base)
 # ══════════════════════════════════════════════════════════════════════════════
 TUTOR_PROMPT = PromptTemplate.from_template(
     "You are a Signals and Systems tutor assistant.\n\n"
@@ -881,36 +857,6 @@ TUTOR_PROMPT = PromptTemplate.from_template(
     "Answer:"
 )
 
-CHECK_PROMPT = PromptTemplate.from_template(
-    "You are a Signals and Systems tutor marking a student's handwritten solution.\n\n"
-    "The correct memo solution is provided below as context.\n"
-    "The student's handwritten work has been extracted via OCR and may contain small "
-    "recognition errors — use your judgement to interpret garbled symbols.\n\n"
-    "Your task:\n"
-    "1. State whether the student's answer is CORRECT, PARTIALLY CORRECT, or INCORRECT.\n"
-    "2. Identify every error or missing step clearly.\n"
-    "3. Explain what the correct approach should be for each error.\n"
-    "4. Be encouraging — point out what they did right too.\n\n"
-    "Memo context (correct solution):\n{context}\n\n"
-    "Student's handwritten work (OCR extracted):\n{question}\n\n"
-    "Marking feedback:"
-)
-
-GENERAL_PHOTO_PROMPT = PromptTemplate.from_template(
-    "You are a patient Signals and Systems tutor. A student has sent you a photo of "
-    "their handwritten work and has given you a specific instruction.\n\n"
-    "The handwriting has been extracted via OCR and may contain small recognition errors.\n\n"
-    "Student's instruction: {task}\n\n"
-    "Student's handwritten work (OCR extracted):\n{question}\n\n"
-    "Rules:\n"
-    "- Respond directly to what the student asked.\n"
-    "- Use clear numbered steps where appropriate.\n"
-    "- Explain your reasoning — don't just state conclusions.\n"
-    "- Be encouraging: acknowledge what they got right, then address errors.\n"
-    "- If the OCR looks garbled in a critical spot, say so and give your best interpretation.\n\n"
-    "Your response:"
-)
-
 
 def format_docs(docs):
     return "\n\n".join(doc.page_content for doc in docs)
@@ -918,12 +864,7 @@ def format_docs(docs):
 
 def build_chains(vs):
     retriever = vs.as_retriever(search_type="similarity", search_kwargs={"k": 3})
-
-    llm = ChatTogether(
-        model="meta-llama/Meta-Llama-3-8B-Instruct-Lite",
-        temperature=0.7,
-        max_tokens=1024,
-    )
+    llm = ChatTogether(model=LLM_MODEL, temperature=0.7, max_tokens=1024)
 
     def make_rag(prompt):
         return (
@@ -931,21 +872,16 @@ def build_chains(vs):
             | prompt | llm | StrOutputParser()
         )
 
-    general_photo_chain = (
-        {"task": lambda x: x["task"], "question": lambda x: x["question"]}
-        | GENERAL_PHOTO_PROMPT | llm | StrOutputParser()
-    )
-
-    return make_rag(TUTOR_PROMPT), make_rag(CHECK_PROMPT), general_photo_chain
+    return make_rag(TUTOR_PROMPT)
 
 
-# ── Boot up vector store and chains ───────────────────────────────────────────
+# ── Boot up vector store (read-only from this point on) ───────────────────────
 vector_store = build_vector_store_if_needed(PDF_FOLDER, CHROMA_DIR)
-qa_chain = check_chain = photo_chain = None
+qa_chain     = None
 
 if vector_store:
-    qa_chain, check_chain, photo_chain = build_chains(vector_store)
-    print("✅ RAG chains ready")
+    qa_chain = build_chains(vector_store)
+    print("✅ RAG chain ready (read-only)")
 else:
     print("⚠️  Running without knowledge base — add PDFs to knowledge_base/ and redeploy.")
 
@@ -953,22 +889,23 @@ scorer = SentenceTransformer(EMBEDDING_MODEL)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TELEGRAM HANDLERS
+# TELEGRAM UTILITY
 # ══════════════════════════════════════════════════════════════════════════════
-async def send_long(update: Update, text: str):
+async def send_long(update: Update, text: str) -> None:
     for i in range(0, len(text), 4096):
         await update.message.reply_text(text[i:i + 4096])
 
 
-async def send_long_code(update: Update, text: str):
-    """Send math output wrapped in a monospace code block for alignment."""
-    # Telegram code blocks have a 4096 char limit; account for the 6 backtick chars
+async def send_long_code(update: Update, text: str) -> None:
     chunk_size = 4090
     for i in range(0, len(text), chunk_size):
         chunk = text[i:i + chunk_size]
         await update.message.reply_text(f"```\n{chunk}\n```", parse_mode="Markdown")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# COMMAND HANDLERS
+# ══════════════════════════════════════════════════════════════════════════════
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Hi! I'm your *Signals & Systems* tutor bot.\n\n"
@@ -979,14 +916,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📐 *Laplace Transform*\n"
         "   _laplace of e^(-2*t)*u(t)_\n\n"
         "📡 *Fourier Transform*\n"
-        "   _fourier transform of e^(-t)*u(t)_\n"
-        "   _FT of 1_,  _what is the Fourier transform of u(t)_\n\n"
+        "   _fourier transform of e^(-t)*u(t)_\n\n"
         "🎵 *Fourier Series*\n"
         "   _fourier series of t, T=2_\n\n"
         "🔁 *Convolution*\n"
         "   _convolve u(t) with e^(-t)*u(t)_\n\n"
-        "📷 *Mark handwritten work* — send a photo\n"
-        "📄 *Add documents* — send a PDF (admin only)\n"
+        "📷 *Upload a photo* — send handwritten work\n"
+        "   With caption → I do what you ask\n"
+        "   No caption   → compared to a loaded memo\n\n"
+        "📄 *Upload a PDF or image* — question paper, memo, textbook\n"
+        "   Sent as a file → loaded as session context\n"
+        "   Then ask: _solve question 3_, _mark my work_, _explain this_\n\n"
         "🧮 *Exam mark calculator* — _how much do I need to pass_\n\n"
         "Use /help for the full guide.",
         parse_mode="Markdown"
@@ -997,25 +937,26 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🆘 *Full guide:*\n\n"
         "1️⃣ *Laplace Transform*\n"
-        "   _laplace of e^(-2*t)*u(t)_\n"
-        "   _what is the Laplace transform of 1_\n\n"
+        "   _laplace of e^(-2*t)*u(t)_\n\n"
         "2️⃣ *Fourier Transform*\n"
-        "   _fourier transform of e^(-t)*u(t)_\n"
-        "   _FT of 1_,  _what is the FT of u(t)_\n"
-        "   _compute FT of Heaviside(t)_\n\n"
+        "   _fourier transform of e^(-t)*u(t)_\n\n"
         "3️⃣ *Fourier Series*\n"
-        "   _fourier series of t, T=2_\n"
         "   _fourier series of t**2, T=2*pi_\n\n"
         "4️⃣ *Convolution*\n"
-        "   _convolve e^(-t)*u(t) with u(t)_\n"
-        "   _convolution of u(t) and u(t-2)_\n\n"
+        "   _convolve e^(-t)*u(t) with u(t)_\n\n"
         "5️⃣ *Plot signals*\n"
         "   Continuous: _plot 2*u(t-2)_\n"
         "   Discrete:   _draw u[n]-u[n-3]_\n\n"
-        "6️⃣ *Handwritten work* — send a photo\n"
-        "   📌 With caption → I do what you ask\n"
-        "   📌 No caption → compared to memo\n\n"
-        "7️⃣ *Add document* — send a PDF (admin only)\n\n"
+        "6️⃣ *Upload a PDF or image file*\n"
+        "   Send the file → bot loads it as session context\n"
+        "   Then send a follow-up message:\n"
+        "     _solve question 2b_\n"
+        "     _mark my work against this memo_\n"
+        "     _explain what question 3 is asking_\n"
+        "   ⚠️ Uploaded files are session-only — not saved permanently.\n\n"
+        "7️⃣ *Handwritten photo*\n"
+        "   📌 With caption → bot follows your instruction\n"
+        "   📌 No caption   → compared against loaded session memo\n\n"
         "8️⃣ *Mark calculator*\n"
         "   _how much do I need to pass_\n\n"
         "💡 Use * for multiply, ** for power\n"
@@ -1024,53 +965,80 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# TEXT HANDLER
+# ══════════════════════════════════════════════════════════════════════════════
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     question = update.message.text.strip()
     q_lower  = question.lower()
     msg_id   = update.message.message_id
+    chat_id  = update.effective_chat.id
 
-    # ── Mark calculator (checked first — intercepts numeric replies in session) ─
+    # ── 1. Mark calculator (intercepts numeric replies in its own session) ─────
     if await handle_mark_session(update, context):
         return
 
-    # ── Laplace Transform ──────────────────────────────────────────────────────
+    # ── 2. Session-based document Q&A ─────────────────────────────────────────
+    # If the student previously uploaded a file, use it as primary context.
+    # This runs BEFORE the RAG chain so it cannot modify the knowledge base.
+    if session_has(chat_id):
+        sess = session_get(chat_id)
+
+        # Handle a pending "mark this photo against the loaded memo" flow
+        pending_work = context.user_data.pop("pending_student_work", None)
+        if pending_work:
+            await update.message.reply_text(
+                f"⏳ Marking against *{sess['source']}*…", parse_mode="Markdown")
+            prompt   = _prompt_mark(sess["text"], pending_work)
+            response = _call_llm(prompt)
+            await send_long(update, response)
+            session_clear(chat_id)
+            await update.message.reply_text(
+                "_(Session cleared — uploaded file no longer in memory.)_",
+                parse_mode="Markdown")
+            return
+
+        await update.message.reply_text(
+            f"⏳ Working on it using *{sess['source']}* as reference…",
+            parse_mode="Markdown")
+        prompt   = _route_session_prompt(sess["text"], question)
+        response = _call_llm(prompt)
+        await send_long(update, response)
+        session_clear(chat_id)
+        await update.message.reply_text(
+            "_(Session cleared — uploaded file no longer in memory.)_",
+            parse_mode="Markdown")
+        return
+
+    # ── 3. Math tools (Laplace, Fourier, Series, Convolution, Plot) ───────────
     if is_laplace(q_lower):
         expr_str = extract_expr(question)
         if not expr_str:
             await update.message.reply_text(
                 "⚠️ Please include an expression, e.g.:\n"
-                "  _laplace of e^(-2*t)*u(t)_\n"
-                "  _what is the Laplace transform of 1_",
-                parse_mode="Markdown")
+                "  _laplace of e^(-2*t)*u(t)_", parse_mode="Markdown")
             return
         await update.message.reply_text("⏳ Computing Laplace transform…")
-        result = compute_laplace(expr_str)
-        await send_long_code(update, result)
+        await send_long_code(update, compute_laplace(expr_str))
         return
 
-    # ── Fourier Transform ──────────────────────────────────────────────────────
     if is_fourier(q_lower):
         expr_str = extract_expr(question)
         if not expr_str:
             await update.message.reply_text(
                 "⚠️ Please include an expression, e.g.:\n"
-                "  _fourier transform of e^(-t)*u(t)_\n"
-                "  _FT of 1_",
-                parse_mode="Markdown")
+                "  _fourier transform of e^(-t)*u(t)_", parse_mode="Markdown")
             return
         await update.message.reply_text("⏳ Computing Fourier transform…")
-        result = compute_fourier(expr_str)
-        await send_long_code(update, result)
+        await send_long_code(update, compute_fourier(expr_str))
         return
 
-    # ── Fourier Series ─────────────────────────────────────────────────────────
     if is_fs(q_lower):
         period = _extract_period(question)
         if not period:
             await update.message.reply_text(
                 "⚠️ Please include the period, e.g.:\n"
-                "  _fourier series of t, T=2_",
-                parse_mode="Markdown")
+                "  _fourier series of t, T=2_", parse_mode="Markdown")
             return
         expr_str = extract_expr(question)
         if not expr_str:
@@ -1078,18 +1046,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             expr_str = extract_expr(expr_str) or expr_str
         await update.message.reply_text(
             f"⏳ Computing Fourier series for f(t)={expr_str}, T={period:.4g}…")
-        result = compute_fourier_series(expr_str, period)
-        await send_long_code(update, result)
+        await send_long_code(update, compute_fourier_series(expr_str, period))
         return
 
-    # ── Convolution ────────────────────────────────────────────────────────────
     if is_conv(q_lower):
         e1, e2 = _parse_two_signals(question)
         if not (e1 and e2):
             await update.message.reply_text(
                 "⚠️ Please specify both signals, e.g.:\n"
-                "  _convolve e^(-t)*u(t) with u(t)_",
-                parse_mode="Markdown")
+                "  _convolve e^(-t)*u(t) with u(t)_", parse_mode="Markdown")
             return
         await update.message.reply_text(
             f"⏳ Computing convolution of  f(t)={e1}  and  g(t)={e2}…")
@@ -1101,7 +1066,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption="📊 Numerical convolution (f ★ g)(t)")
         return
 
-    # ── Plot ───────────────────────────────────────────────────────────────────
     if is_plot(q_lower):
         await update.message.reply_text("📊 Generating plot…")
         fig_path = generate_plot(question, msg_id)
@@ -1111,17 +1075,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(
                 "⚠️ Could not parse that expression.\n"
-                "Examples:\n"
-                "  _plot 2*u(t-2)_\n"
-                "  _draw u[n] - u[n-3]_\n"
-                "  _sketch e^(-2*t)*u(t)_",
+                "Examples:\n  _plot 2*u(t-2)_\n  _draw u[n] - u[n-3]_",
                 parse_mode="Markdown")
         return
 
-    # ── General tutor Q&A ──────────────────────────────────────────────────────
+    # ── 4. General tutor Q&A via RAG chain ────────────────────────────────────
     if not qa_chain:
         await update.message.reply_text(
-            "⚠️ No knowledge base loaded yet. The admin needs to add PDFs.")
+            "⚠️ No knowledge base loaded yet. Please ask the administrator.")
         return
     await update.message.reply_text("🤔 Thinking…")
     try:
@@ -1131,78 +1092,153 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Something went wrong: {str(e)}")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# PHOTO HANDLER  (handwritten work — session-aware)
+# ══════════════════════════════════════════════════════════════════════════════
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = (update.message.caption or "").strip()
+    chat_id = update.effective_chat.id
+
     await update.message.reply_text(
-        "📷 Got your photo! Running handwriting recognition… "
-        "(this takes ~15–30s on CPU)"
-    )
+        "📷 Got your photo — running handwriting recognition… (~15–30s)")
+
+    # Download into memory only
+    photo_file = await update.message.photo[-1].get_file()
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+        tmp_path = tmp.name
+    await photo_file.download_to_drive(tmp_path)
     try:
-        photo_file = await update.message.photo[-1].get_file()
-        img_path   = os.path.join(IMG_FOLDER, f"{update.message.message_id}.jpg")
-        await photo_file.download_to_drive(img_path)
+        with open(tmp_path, "rb") as fh:
+            image_bytes = fh.read()
+    finally:
+        os.unlink(tmp_path)
 
-        extracted = extract_handwritten_text(img_path)
-        await update.message.reply_text(
-            f"📝 Extracted handwriting:\n\n{extracted}\n\n⏳ Processing…"
-        )
+    extracted = _ocr_image_bytes(image_bytes, "jpeg")
+    await update.message.reply_text(
+        f"📝 *Extracted handwriting:*\n\n{extracted}", parse_mode="Markdown")
 
-        if caption:
-            if not photo_chain:
-                await update.message.reply_text(
-                    "⚠️ Bot not fully initialised yet.")
-                return
-            response = photo_chain.invoke({"task": caption, "question": extracted})
+    sess = session_get(chat_id)
+
+    if caption:
+        # Caption with a loaded memo → mark student work against memo
+        mark_keywords = ["mark", "check", "compare", "grade", "evaluate", "feedback"]
+        if sess and any(kw in caption.lower() for kw in mark_keywords):
+            await update.message.reply_text(
+                f"⏳ Marking against *{sess['source']}*…", parse_mode="Markdown")
+            prompt   = _prompt_mark(sess["text"], extracted)
+            response = _call_llm(prompt)
+            await send_long(update, response)
+            session_clear(chat_id)
+            await update.message.reply_text(
+                "_(Session cleared — uploaded file no longer in memory.)_",
+                parse_mode="Markdown")
         else:
-            if not check_chain:
+            # Treat the photo as context + caption as instruction
+            doc_text = sess["text"] if sess else extracted
+            source   = sess["source"] if sess else "handwritten photo"
+            await update.message.reply_text(
+                f"⏳ Processing using *{source}* as reference…",
+                parse_mode="Markdown")
+            prompt   = _route_session_prompt(doc_text, caption)
+            response = _call_llm(prompt)
+            await send_long(update, response)
+            if sess:
+                session_clear(chat_id)
                 await update.message.reply_text(
-                    "⚠️ No memo loaded. Add a caption to tell me what you'd like me to do.")
-                return
-            response = check_chain.invoke(extracted)
+                    "_(Session cleared — uploaded file no longer in memory.)_",
+                    parse_mode="Markdown")
+    else:
+        # No caption: if a memo is loaded, offer to mark; otherwise ask what to do
+        if sess:
+            context.user_data["pending_student_work"] = extracted
+            await update.message.reply_text(
+                f"I have *{sess['source']}* loaded as your memo/reference.\n\n"
+                "Reply *mark* to compare your work against it, or tell me what "
+                "else you'd like me to do.",
+                parse_mode="Markdown")
+        else:
+            # Store the photo as session context so next message can use it
+            session_store(chat_id, extracted, "Handwritten photo")
+            await update.message.reply_text(
+                "Photo loaded. What would you like me to do?\n"
+                "  • _Solve this_\n"
+                "  • _Explain step by step_\n"
+                "  • _What is this question asking?_")
 
-        await send_long(update, response)
-    except Exception as e:
-        await update.message.reply_text(f"❌ OCR failed: {str(e)}")
 
-
+# ══════════════════════════════════════════════════════════════════════════════
+# DOCUMENT HANDLER  (PDF or image file — session context only, never persisted)
+# ══════════════════════════════════════════════════════════════════════════════
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin-only: upload a new PDF to the knowledge base."""
-    global vector_store, qa_chain, check_chain, photo_chain
+    """
+    Any user may upload a file (PDF or image) as temporary session context.
+    The file is read into memory and then discarded — it is NEVER written to
+    PDF_FOLDER, CHROMA_DIR, or any other persistent location.
+    The permanent knowledge base is not touched.
+    """
+    doc       = update.message.document
+    caption   = (update.message.caption or "").strip()
+    chat_id   = update.effective_chat.id
+    file_name = doc.file_name or "uploaded_file"
+    extension = os.path.splitext(file_name)[-1].lower()
 
-    if update.effective_user.id != ADMIN_USER_ID:
+    SUPPORTED_IMAGES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+    if extension not in {".pdf"} | SUPPORTED_IMAGES:
         await update.message.reply_text(
-            "⚠️ Only the administrator can upload documents to the knowledge base.")
-        return
-
-    doc = update.message.document
-    if not doc.file_name.endswith(".pdf"):
-        await update.message.reply_text("⚠️ Please send a PDF file.")
+            "⚠️ Unsupported file type. Please send a PDF or an image (PNG, JPG, WEBP).")
         return
 
     await update.message.reply_text(
-        f"📄 Received *{doc.file_name}* — adding to knowledge base…",
-        parse_mode="Markdown"
-    )
+        f"📄 Received *{file_name}* — extracting content…\n"
+        f"_(This file is used for this session only and will not be saved permanently.)_",
+        parse_mode="Markdown")
+
+    # Download into a temp file, read bytes, delete immediately
+    tg_file = await doc.get_file()
+    with tempfile.NamedTemporaryFile(suffix=extension, delete=False) as tmp:
+        tmp_path = tmp.name
+    await tg_file.download_to_drive(tmp_path)
     try:
-        pdf_file = await doc.get_file()
-        pdf_path = os.path.join(PDF_FOLDER, doc.file_name)
-        await pdf_file.download_to_drive(pdf_path)
+        with open(tmp_path, "rb") as fh:
+            file_bytes = fh.read()
+    finally:
+        os.unlink(tmp_path)   # temp file gone; only bytes in memory remain
 
-        if os.path.exists(CHROMA_DIR):
-            shutil.rmtree(CHROMA_DIR)
-        os.makedirs(CHROMA_DIR, exist_ok=True)
+    # Extract text (never touches the knowledge base)
+    if extension == ".pdf":
+        extracted = _extract_pdf_bytes(file_bytes)
+        source    = f"PDF: {file_name}"
+    else:
+        mime      = "jpeg" if extension in (".jpg", ".jpeg") else extension.lstrip(".")
+        extracted = _ocr_image_bytes(file_bytes, mime)
+        source    = f"Image: {file_name}"
 
-        vector_store                       = build_vector_store_if_needed(PDF_FOLDER, CHROMA_DIR)
-        qa_chain, check_chain, photo_chain = build_chains(vector_store)
+    # Store in session memory only
+    session_store(chat_id, extracted, source)
 
+    preview = extracted[:300].replace("\n", " ")
+    await update.message.reply_text(
+        f"✅ Content loaded from *{source}*.\n\n"
+        f"Preview: _{preview}…_\n\n"
+        f"Now tell me what you'd like me to do:\n"
+        f"  • _Solve question 3_\n"
+        f"  • _Mark my work against this memo_\n"
+        f"  • _Explain what this question is asking_",
+        parse_mode="Markdown")
+
+    # If a caption was provided, act on it immediately
+    if caption:
+        sess   = session_get(chat_id)
+        prompt = _route_session_prompt(sess["text"], caption)
         await update.message.reply_text(
-            f"✅ *{doc.file_name}* added! Knowledge base now has "
-            f"{vector_store._collection.count()} vectors.\n\n"
-            "Students can now ask questions about this document.",
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed to process PDF: {str(e)}")
+            f"⏳ Also acting on your caption: _{caption}_…",
+            parse_mode="Markdown")
+        response = _call_llm(prompt)
+        await send_long(update, response)
+        session_clear(chat_id)
+        await update.message.reply_text(
+            "_(Session cleared — uploaded file no longer in memory.)_",
+            parse_mode="Markdown")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1213,8 +1249,8 @@ async def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help",  help_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(MessageHandler(filters.PHOTO,                   handle_photo))
-    app.add_handler(MessageHandler(filters.Document.PDF,            handle_document))
+    app.add_handler(MessageHandler(filters.PHOTO,          handle_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL,   handle_document))
     print("✅ Bot is running!")
     await app.run_polling(drop_pending_updates=True)
 
