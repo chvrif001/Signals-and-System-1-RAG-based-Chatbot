@@ -36,7 +36,7 @@ nest_asyncio.apply()
 BOT_TOKEN         = os.environ["BOT_TOKEN"]
 TOGETHER_API_KEY  = os.environ["TOGETHER_API_KEY"]
 ADMIN_USER_ID     = int(os.environ.get("ADMIN_USER_ID", "0"))
-QWEN_VISION_MODEL = "Qwen/Qwen2.5-7B-Instruct-Turbo"
+QWEN_VISION_MODEL = "meta/llama-3.2-90b-vision-instruct"
 LLM_MODEL         = "meta-llama/Meta-Llama-3-8B-Instruct-Lite"
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
