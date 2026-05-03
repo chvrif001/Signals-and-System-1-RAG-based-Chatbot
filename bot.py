@@ -732,48 +732,39 @@ def _ocr_image_bytes(image_bytes: bytes, mime: str) -> str:
     b64      = base64.b64encode(image_bytes).decode("utf-8")
     data_url = f"data:image/{mime};base64,{b64}"
 
-    payload = {
-        "model": VISION_MODEL,
-        "max_tokens": 2048,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": data_url},
-                    },
-                    {
-                        "type": "text",
-                        "text": (
-                            "You are an OCR assistant. Transcribe ALL handwritten text "
-                            "and mathematical expressions in this image exactly as written. "
-                            "Preserve equations, symbols, numbering, and layout. "
-                            "Output ONLY the transcribed content — "
-                            "no commentary, no explanations, no translations."
-                        ),
-                    },
-                ],
-            }
-        ],
-    }
-
-    endpoint = _get_endpoint(VISION_MODEL)
-    headers  = {
-        "Authorization": f"Bearer {TOGETHER_API_KEY}",
-        "Content-Type":  "application/json",
-    }
-
-    print(f"[OCR] Sending {len(image_bytes)} bytes to {endpoint} "
-          f"using model {VISION_MODEL}")
+    print(f"[OCR] Sending {len(image_bytes)} bytes using model {VISION_MODEL}")
 
     try:
-        resp = requests.post(endpoint, json=payload, headers=headers, timeout=90)
-        resp.raise_for_status()
-        data    = resp.json()
-        content = data["choices"][0]["message"]["content"].strip()
+        from together import Together
+        client  = Together(api_key=TOGETHER_API_KEY)
+        # Text block FIRST, then image — required by Together AI
+        response = client.chat.completions.create(
+            model=VISION_MODEL,
+            max_tokens=2048,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "You are an OCR assistant. Transcribe ALL handwritten text "
+                                "and mathematical expressions in this image exactly as written. "
+                                "Preserve equations, symbols, numbering, and layout. "
+                                "Output ONLY the transcribed content — "
+                                "no commentary, no explanations, no translations."
+                            ),
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": data_url},
+                        },
+                    ],
+                }
+            ],
+        )
+        content = response.choices[0].message.content.strip()
 
-        # Check for known failure phrases
         if any(sig.lower() in content.lower() for sig in _OCR_FAILURE_SIGNALS):
             print(f"[OCR] Suspicious response: {content[:200]}")
             return ("❌ OCR failed: the model did not receive the image correctly. "
@@ -782,23 +773,9 @@ def _ocr_image_bytes(image_bytes: bytes, mime: str) -> str:
         print(f"[OCR] Success — extracted {len(content)} characters")
         return content
 
-    except requests.exceptions.HTTPError as e:
-        status = e.response.status_code if e.response is not None else "?"
-        body   = e.response.text[:300] if e.response is not None else ""
-        print(f"[OCR] HTTP {status}: {body}")
-        # 422 often means the model doesn't accept this image format via NIM
-        if status == 422:
-            return ("❌ OCR failed: the vision model rejected the image "
-                    f"(HTTP 422). Try sending a plain JPEG. Details: {body}")
-        return f"❌ OCR request failed (HTTP {status}): {e}"
-
-    except requests.exceptions.RequestException as e:
-        print(f"[OCR] Request error: {e}")
+    except Exception as e:
+        print(f"[OCR] Error: {e}")
         return f"❌ OCR request failed: {e}"
-
-    except (KeyError, IndexError) as e:
-        print(f"[OCR] Unexpected response format: {e}")
-        return f"❌ OCR response could not be parsed: {e}"
 
 
 def _extract_pdf_bytes(pdf_bytes: bytes) -> str:
