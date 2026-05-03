@@ -41,7 +41,7 @@ ADMIN_USER_ID     = int(os.environ.get("ADMIN_USER_ID", "0"))
 # Options:
 #   "nim/meta/llama-3.2-11b-vision-instruct"  ← faster
 #   "nim/meta/llama-3.2-90b-vision-instruct"  ← more accurate
-VISION_MODEL = "nim/meta/llama-3.2-90b-vision-instruct"
+VISION_MODEL = "meta-llama/Llama-3.2-90B-Vision-Instruct-Turbo"
 
 LLM_MODEL    = "meta-llama/Meta-Llama-3-8B-Instruct-Lite"
 
