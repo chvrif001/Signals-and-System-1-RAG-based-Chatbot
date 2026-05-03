@@ -47,12 +47,10 @@ LLM_MODEL    = "meta-llama/Meta-Llama-3-8B-Instruct-Lite"
 
 # ── API endpoints ─────────────────────────────────────────────────────────────
 TOGETHER_ENDPOINT = "https://api.together.xyz/v1/chat/completions"
-NIM_ENDPOINT      = "https://integrate.api.nvidia.com/v1/chat/completions"
-
 
 def _get_endpoint(model: str) -> str:
-    """Return the correct API endpoint based on the model prefix."""
-    return NIM_ENDPOINT if model.startswith("nim/") else TOGETHER_ENDPOINT
+    """All models, including nim/* prefixed ones, are served via Together AI."""
+    return TOGETHER_ENDPOINT
 
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
