@@ -666,23 +666,49 @@ async def handle_mark_session(update: Update,
 # ══════════════════════════════════════════════════════════════════════════════
 def _ocr_image_bytes(image_bytes: bytes, mime: str) -> str:
     """Send image bytes to Qwen Vision and return extracted text."""
+
+    # Guard: empty bytes means the download failed
+    if not image_bytes or len(image_bytes) < 100:
+        return f"❌ OCR failed: image data is empty or too small ({len(image_bytes)} bytes)"
+
+    # Normalise mime type — Together AI only accepts jpeg/png/webp/gif
+    mime = mime.lower().lstrip(".")
+    if mime in ("jpg",):
+        mime = "jpeg"
+    if mime not in ("jpeg", "png", "webp", "gif"):
+        mime = "jpeg"   # safe fallback for unknown types
+
     b64 = base64.b64encode(image_bytes).decode("utf-8")
+    data_url = f"data:image/{mime};base64,{b64}"
+
+    # Together AI Qwen2.5-VL expects the image FIRST, then the text prompt,
+    # both inside a single user message as a list of content blocks.
     payload = {
         "model": QWEN_VISION_MODEL,
         "max_tokens": 2048,
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "image_url",
-                 "image_url": {"url": f"data:image/{mime};base64,{b64}"}},
-                {"type": "text",
-                 "text": (
-                     "Transcribe ALL text and mathematical expressions in this image "
-                     "exactly as written. Preserve equations, symbols, numbering, and "
-                     "layout as closely as possible. Output only the transcribed content."
-                 )},
-            ],
-        }],
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": data_url,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "You are an OCR assistant. Transcribe ALL handwritten text "
+                            "and mathematical expressions in this image exactly as written. "
+                            "Preserve equations, symbols, numbering, and layout. "
+                            "Output ONLY the transcribed content in English — "
+                            "no commentary, no explanations, no translations."
+                        ),
+                    },
+                ],
+            }
+        ],
     }
     headers = {
         "Authorization": f"Bearer {TOGETHER_API_KEY}",
@@ -691,12 +717,21 @@ def _ocr_image_bytes(image_bytes: bytes, mime: str) -> str:
     try:
         resp = requests.post(
             "https://api.together.xyz/v1/chat/completions",
-            json=payload, headers=headers, timeout=60)
+            json=payload, headers=headers, timeout=90)
         resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
+        data    = resp.json()
+        content = data["choices"][0]["message"]["content"].strip()
+        # Sanity check: if the model responded in Chinese or about JavaScript,
+        # the image likely wasn't received — surface the raw response as an error
+        if "[object" in content or ("看起来" in content and len(content) > 50):
+            print(f"[OCR] Suspicious response (model may not have received image): {content[:200]}")
+            return "❌ OCR failed: the model did not receive the image correctly. Please try again."
+        return content
     except requests.exceptions.RequestException as e:
+        print(f"[OCR] Request error: {e}")
         return f"❌ OCR request failed: {e}"
     except (KeyError, IndexError) as e:
+        print(f"[OCR] Unexpected response format: {e}")
         return f"❌ OCR response could not be parsed: {e}"
 
 
@@ -1108,16 +1143,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📷 Got your photo — running handwriting recognition… (~15–30s)")
 
-    # Download into memory only
-    photo_file = await update.message.photo[-1].get_file()
-    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-        tmp_path = tmp.name
-    await photo_file.download_to_drive(tmp_path)
-    try:
-        with open(tmp_path, "rb") as fh:
-            image_bytes = fh.read()
-    finally:
-        os.unlink(tmp_path)
+    # Download directly into memory — no temp file, no race condition
+    import io
+    photo_file  = await update.message.photo[-1].get_file()
+    buf         = io.BytesIO()
+    await photo_file.download_to_memory(buf)
+    image_bytes = buf.getvalue()
+    print(f"[handle_photo] Downloaded {len(image_bytes)} bytes")
 
     extracted = _ocr_image_bytes(image_bytes, "jpeg")
     await update.message.reply_text(
