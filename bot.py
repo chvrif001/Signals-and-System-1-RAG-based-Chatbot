@@ -36,12 +36,28 @@ nest_asyncio.apply()
 BOT_TOKEN         = os.environ["BOT_TOKEN"]
 TOGETHER_API_KEY  = os.environ["TOGETHER_API_KEY"]
 ADMIN_USER_ID     = int(os.environ.get("ADMIN_USER_ID", "0"))
-QWEN_VISION_MODEL = "meta/llama-3.2-90b-vision-instruct"
-LLM_MODEL         = "meta-llama/Meta-Llama-3-8B-Instruct-Lite"
+
+# Vision model — using Llama 3.2 Vision via NVIDIA NIM on Together AI
+# Options:
+#   "nim/meta/llama-3.2-11b-vision-instruct"  ← faster
+#   "nim/meta/llama-3.2-90b-vision-instruct"  ← more accurate
+VISION_MODEL = "nim/meta/llama-3.2-11b-vision-instruct"
+
+LLM_MODEL    = "meta-llama/Meta-Llama-3-8B-Instruct-Lite"
+
+# ── API endpoints ─────────────────────────────────────────────────────────────
+TOGETHER_ENDPOINT = "https://api.together.xyz/v1/chat/completions"
+NIM_ENDPOINT      = "https://integrate.api.nvidia.com/v1/chat/completions"
+
+
+def _get_endpoint(model: str) -> str:
+    """Return the correct API endpoint based on the model prefix."""
+    return NIM_ENDPOINT if model.startswith("nim/") else TOGETHER_ENDPOINT
+
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-PDF_FOLDER  = "./knowledge_base"   # read-only after startup
-CHROMA_DIR  = os.environ.get("CHROMA_DIR", "/data/chroma_db")  # read-only after startup
+PDF_FOLDER  = "./knowledge_base"
+CHROMA_DIR  = os.environ.get("CHROMA_DIR", "/data/chroma_db")
 PLOT_FOLDER = "/tmp/plots"
 
 os.makedirs(PDF_FOLDER,  exist_ok=True)
@@ -53,7 +69,6 @@ os.environ["TOGETHER_API_KEY"] = TOGETHER_API_KEY
 # ══════════════════════════════════════════════════════════════════════════════
 # SESSION STORE  — in-memory, per chat_id, never touches the knowledge base
 # ══════════════════════════════════════════════════════════════════════════════
-# Structure: { chat_id: {"text": str, "source": str} }
 _session_store: dict[int, dict] = {}
 
 
@@ -662,29 +677,40 @@ async def handle_mark_session(update: Update,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# OCR — Qwen2.5 Vision via Together AI
+# OCR — Llama 3.2 Vision via NVIDIA NIM on Together AI
 # ══════════════════════════════════════════════════════════════════════════════
+
+# Phrases that indicate the model did not receive or cannot see the image
+_OCR_FAILURE_SIGNALS = [
+    "[object", "看起来", "无法", "图片", "I cannot see",
+    "no image", "didn't receive", "can't see the image",
+    "don't see any image", "no image was provided",
+    "I don't have the ability to view",
+    "I'm unable to view", "cannot view",
+    "there is no image", "not able to see",
+]
+
+
 def _ocr_image_bytes(image_bytes: bytes, mime: str) -> str:
-    """Send image bytes to Qwen Vision and return extracted text."""
+    """Send image bytes to the vision model and return extracted text."""
 
     # Guard: empty bytes means the download failed
     if not image_bytes or len(image_bytes) < 100:
-        return f"❌ OCR failed: image data is empty or too small ({len(image_bytes)} bytes)"
+        return (f"❌ OCR failed: image data is empty or too small "
+                f"({len(image_bytes)} bytes)")
 
-    # Normalise mime type — Together AI only accepts jpeg/png/webp/gif
+    # Normalise mime type
     mime = mime.lower().lstrip(".")
     if mime in ("jpg",):
         mime = "jpeg"
     if mime not in ("jpeg", "png", "webp", "gif"):
-        mime = "jpeg"   # safe fallback for unknown types
+        mime = "jpeg"
 
-    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    b64      = base64.b64encode(image_bytes).decode("utf-8")
     data_url = f"data:image/{mime};base64,{b64}"
 
-    # Together AI Qwen2.5-VL expects the image FIRST, then the text prompt,
-    # both inside a single user message as a list of content blocks.
     payload = {
-        "model": QWEN_VISION_MODEL,
+        "model": VISION_MODEL,
         "max_tokens": 2048,
         "messages": [
             {
@@ -692,9 +718,7 @@ def _ocr_image_bytes(image_bytes: bytes, mime: str) -> str:
                 "content": [
                     {
                         "type": "image_url",
-                        "image_url": {
-                            "url": data_url,
-                        },
+                        "image_url": {"url": data_url},
                     },
                     {
                         "type": "text",
@@ -702,7 +726,7 @@ def _ocr_image_bytes(image_bytes: bytes, mime: str) -> str:
                             "You are an OCR assistant. Transcribe ALL handwritten text "
                             "and mathematical expressions in this image exactly as written. "
                             "Preserve equations, symbols, numbering, and layout. "
-                            "Output ONLY the transcribed content in English — "
+                            "Output ONLY the transcribed content — "
                             "no commentary, no explanations, no translations."
                         ),
                     },
@@ -710,26 +734,45 @@ def _ocr_image_bytes(image_bytes: bytes, mime: str) -> str:
             }
         ],
     }
-    headers = {
+
+    endpoint = _get_endpoint(VISION_MODEL)
+    headers  = {
         "Authorization": f"Bearer {TOGETHER_API_KEY}",
         "Content-Type":  "application/json",
     }
+
+    print(f"[OCR] Sending {len(image_bytes)} bytes to {endpoint} "
+          f"using model {VISION_MODEL}")
+
     try:
-        resp = requests.post(
-            "https://api.together.xyz/v1/chat/completions",
-            json=payload, headers=headers, timeout=90)
+        resp = requests.post(endpoint, json=payload, headers=headers, timeout=90)
         resp.raise_for_status()
         data    = resp.json()
         content = data["choices"][0]["message"]["content"].strip()
-        # Sanity check: if the model responded in Chinese or about JavaScript,
-        # the image likely wasn't received — surface the raw response as an error
-        if "[object" in content or ("看起来" in content and len(content) > 50):
-            print(f"[OCR] Suspicious response (model may not have received image): {content[:200]}")
-            return "❌ OCR failed: the model did not receive the image correctly. Please try again."
+
+        # Check for known failure phrases
+        if any(sig.lower() in content.lower() for sig in _OCR_FAILURE_SIGNALS):
+            print(f"[OCR] Suspicious response: {content[:200]}")
+            return ("❌ OCR failed: the model did not receive the image correctly. "
+                    "Please try again.")
+
+        print(f"[OCR] Success — extracted {len(content)} characters")
         return content
+
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "?"
+        body   = e.response.text[:300] if e.response is not None else ""
+        print(f"[OCR] HTTP {status}: {body}")
+        # 422 often means the model doesn't accept this image format via NIM
+        if status == 422:
+            return ("❌ OCR failed: the vision model rejected the image "
+                    f"(HTTP 422). Try sending a plain JPEG. Details: {body}")
+        return f"❌ OCR request failed (HTTP {status}): {e}"
+
     except requests.exceptions.RequestException as e:
         print(f"[OCR] Request error: {e}")
         return f"❌ OCR request failed: {e}"
+
     except (KeyError, IndexError) as e:
         print(f"[OCR] Unexpected response format: {e}")
         return f"❌ OCR response could not be parsed: {e}"
@@ -737,16 +780,16 @@ def _ocr_image_bytes(image_bytes: bytes, mime: str) -> str:
 
 def _extract_pdf_bytes(pdf_bytes: bytes) -> str:
     """
-    Extract text from PDF bytes using pypdf (already installed via langchain).
-    Runs entirely in memory via a BytesIO buffer — never touches the knowledge base.
+    Extract text from PDF bytes using pypdf.
+    Runs entirely in memory — never touches the knowledge base.
     """
     import io
     try:
         from pypdf import PdfReader
     except ImportError:
-        from PyPDF2 import PdfReader  # older fallback name
+        from PyPDF2 import PdfReader
 
-    parts = []
+    parts  = []
     reader = PdfReader(io.BytesIO(pdf_bytes))
     for i, page in enumerate(reader.pages, start=1):
         text = (page.extract_text() or "").strip()
@@ -758,7 +801,7 @@ def _extract_pdf_bytes(pdf_bytes: bytes) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SESSION-AWARE LLM CALLS  (uploaded content = primary source of truth)
+# SESSION-AWARE LLM CALLS
 # ══════════════════════════════════════════════════════════════════════════════
 _SESSION_RULES = """IMPORTANT — follow strictly:
 1. The uploaded document is the PRIMARY and authoritative source of truth.
@@ -820,8 +863,7 @@ def _call_llm(prompt: str, max_tokens: int = 1500) -> str:
     }
     try:
         resp = requests.post(
-            "https://api.together.xyz/v1/chat/completions",
-            json=payload, headers=headers, timeout=90)
+            TOGETHER_ENDPOINT, json=payload, headers=headers, timeout=90)
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
@@ -829,7 +871,6 @@ def _call_llm(prompt: str, max_tokens: int = 1500) -> str:
 
 
 def _route_session_prompt(doc_text: str, instruction: str) -> str:
-    """Pick the right prompt template based on the instruction keywords."""
     instr_lower = instruction.lower()
     if any(kw in instr_lower for kw in ["mark", "check", "compare", "correct",
                                           "feedback", "evaluate", "grade"]):
@@ -877,7 +918,7 @@ def build_vector_store_if_needed(pdf_folder: str, chroma_dir: str):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# RAG CHAINS  (used only for general Q&A against the permanent knowledge base)
+# RAG CHAINS
 # ══════════════════════════════════════════════════════════════════════════════
 TUTOR_PROMPT = PromptTemplate.from_template(
     "You are a Signals and Systems tutor assistant.\n\n"
@@ -916,7 +957,7 @@ def build_chains(vs):
     return make_rag(TUTOR_PROMPT)
 
 
-# ── Boot up vector store (read-only from this point on) ───────────────────────
+# ── Boot up vector store ───────────────────────────────────────────────────────
 vector_store = build_vector_store_if_needed(PDF_FOLDER, CHROMA_DIR)
 qa_chain     = None
 
@@ -1015,17 +1056,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg_id   = update.message.message_id
     chat_id  = update.effective_chat.id
 
-    # ── 1. Mark calculator (intercepts numeric replies in its own session) ─────
+    # ── 1. Mark calculator ────────────────────────────────────────────────────
     if await handle_mark_session(update, context):
         return
 
     # ── 2. Session-based document Q&A ─────────────────────────────────────────
-    # If the student previously uploaded a file, use it as primary context.
-    # This runs BEFORE the RAG chain so it cannot modify the knowledge base.
     if session_has(chat_id):
         sess = session_get(chat_id)
 
-        # Handle a pending "mark this photo against the loaded memo" flow
         pending_work = context.user_data.pop("pending_student_work", None)
         if pending_work:
             await update.message.reply_text(
@@ -1051,7 +1089,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown")
         return
 
-    # ── 3. Math tools (Laplace, Fourier, Series, Convolution, Plot) ───────────
+    # ── 3. Math tools ─────────────────────────────────────────────────────────
     if is_laplace(q_lower):
         expr_str = extract_expr(question)
         if not expr_str:
@@ -1134,7 +1172,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PHOTO HANDLER  (handwritten work — session-aware)
+# PHOTO HANDLER
 # ══════════════════════════════════════════════════════════════════════════════
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = (update.message.caption or "").strip()
@@ -1143,7 +1181,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📷 Got your photo — running handwriting recognition… (~15–30s)")
 
-    # Download directly into memory — no temp file, no race condition
     import io
     photo_file  = await update.message.photo[-1].get_file()
     buf         = io.BytesIO()
@@ -1158,7 +1195,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sess = session_get(chat_id)
 
     if caption:
-        # Caption with a loaded memo → mark student work against memo
         mark_keywords = ["mark", "check", "compare", "grade", "evaluate", "feedback"]
         if sess and any(kw in caption.lower() for kw in mark_keywords):
             await update.message.reply_text(
@@ -1171,7 +1207,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "_(Session cleared — uploaded file no longer in memory.)_",
                 parse_mode="Markdown")
         else:
-            # Treat the photo as context + caption as instruction
             doc_text = sess["text"] if sess else extracted
             source   = sess["source"] if sess else "handwritten photo"
             await update.message.reply_text(
@@ -1186,7 +1221,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "_(Session cleared — uploaded file no longer in memory.)_",
                     parse_mode="Markdown")
     else:
-        # No caption: if a memo is loaded, offer to mark; otherwise ask what to do
         if sess:
             context.user_data["pending_student_work"] = extracted
             await update.message.reply_text(
@@ -1195,7 +1229,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "else you'd like me to do.",
                 parse_mode="Markdown")
         else:
-            # Store the photo as session context so next message can use it
             session_store(chat_id, extracted, "Handwritten photo")
             await update.message.reply_text(
                 "Photo loaded. What would you like me to do?\n"
@@ -1205,14 +1238,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DOCUMENT HANDLER  (PDF or image file — session context only, never persisted)
+# DOCUMENT HANDLER
 # ══════════════════════════════════════════════════════════════════════════════
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Any user may upload a file (PDF or image) as temporary session context.
     The file is read into memory and then discarded — it is NEVER written to
     PDF_FOLDER, CHROMA_DIR, or any other persistent location.
-    The permanent knowledge base is not touched.
     """
     doc       = update.message.document
     caption   = (update.message.caption or "").strip()
@@ -1231,7 +1263,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"_(This file is used for this session only and will not be saved permanently.)_",
         parse_mode="Markdown")
 
-    # Download into a temp file, read bytes, delete immediately
     tg_file = await doc.get_file()
     with tempfile.NamedTemporaryFile(suffix=extension, delete=False) as tmp:
         tmp_path = tmp.name
@@ -1240,9 +1271,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with open(tmp_path, "rb") as fh:
             file_bytes = fh.read()
     finally:
-        os.unlink(tmp_path)   # temp file gone; only bytes in memory remain
+        os.unlink(tmp_path)
 
-    # Extract text (never touches the knowledge base)
     if extension == ".pdf":
         extracted = _extract_pdf_bytes(file_bytes)
         source    = f"PDF: {file_name}"
@@ -1251,7 +1281,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         extracted = _ocr_image_bytes(file_bytes, mime)
         source    = f"Image: {file_name}"
 
-    # Store in session memory only
     session_store(chat_id, extracted, source)
 
     preview = extracted[:300].replace("\n", " ")
@@ -1264,7 +1293,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"  • _Explain what this question is asking_",
         parse_mode="Markdown")
 
-    # If a caption was provided, act on it immediately
     if caption:
         sess   = session_get(chat_id)
         prompt = _route_session_prompt(sess["text"], caption)
