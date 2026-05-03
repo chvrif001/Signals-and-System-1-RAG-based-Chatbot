@@ -676,7 +676,7 @@ async def handle_mark_session(update: Update,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# OCR — Llama 3.2 Vision via NVIDIA NIM on Together AI
+# OCR — Qwen2.5-VL Vision via Together AI
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Phrases that indicate the model did not receive or cannot see the image
@@ -690,6 +690,33 @@ _OCR_FAILURE_SIGNALS = [
 ]
 
 
+def _compress_image(image_bytes: bytes, max_kb: int = 1000) -> bytes:
+    """Compress and resize image to under max_kb. Always returns JPEG bytes."""
+    from PIL import Image
+    import io
+    img = Image.open(io.BytesIO(image_bytes))
+    if img.mode in ("RGBA", "P", "LA"):
+        img = img.convert("RGB")
+    # Cap longest side at 1600px to reduce payload size
+    max_side = 1600
+    w, h = img.size
+    if max(w, h) > max_side:
+        scale = max_side / max(w, h)
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+    output = io.BytesIO()
+    quality = 85
+    while quality >= 20:
+        output.seek(0)
+        output.truncate()
+        img.save(output, format="JPEG", quality=quality)
+        if len(output.getvalue()) <= max_kb * 1024:
+            break
+        quality -= 10
+    result = output.getvalue()
+    print(f"[OCR] Compressed: {len(image_bytes)} → {len(result)} bytes (quality={quality})")
+    return result
+
+
 def _ocr_image_bytes(image_bytes: bytes, mime: str) -> str:
     """Send image bytes to the vision model and return extracted text."""
 
@@ -698,12 +725,9 @@ def _ocr_image_bytes(image_bytes: bytes, mime: str) -> str:
         return (f"❌ OCR failed: image data is empty or too small "
                 f"({len(image_bytes)} bytes)")
 
-    # Normalise mime type
-    mime = mime.lower().lstrip(".")
-    if mime in ("jpg",):
-        mime = "jpeg"
-    if mime not in ("jpeg", "png", "webp", "gif"):
-        mime = "jpeg"
+    # Compress to JPEG under 1MB before encoding — avoids oversized payloads
+    image_bytes = _compress_image(image_bytes)
+    mime        = "jpeg"
 
     b64      = base64.b64encode(image_bytes).decode("utf-8")
     data_url = f"data:image/{mime};base64,{b64}"
