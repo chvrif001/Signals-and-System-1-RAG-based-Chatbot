@@ -734,36 +734,41 @@ def _ocr_image_bytes(image_bytes: bytes, mime: str) -> str:
 
     print(f"[OCR] Sending {len(image_bytes)} bytes using model {VISION_MODEL}")
 
+    payload = {
+        "model": VISION_MODEL,
+        "max_tokens": 2048,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "You are an OCR assistant. Transcribe ALL handwritten text "
+                            "and mathematical expressions in this image exactly as written. "
+                            "Preserve equations, symbols, numbering, and layout. "
+                            "Output ONLY the transcribed content — "
+                            "no commentary, no explanations, no translations."
+                        ),
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": data_url},
+                    },
+                ],
+            }
+        ],
+    }
+
+    headers = {
+        "Authorization": f"Bearer {TOGETHER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
     try:
-        from together import Together
-        client  = Together(api_key=TOGETHER_API_KEY)
-        # Text block FIRST, then image — required by Together AI
-        response = client.chat.completions.create(
-            model=VISION_MODEL,
-            max_tokens=2048,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": (
-                                "You are an OCR assistant. Transcribe ALL handwritten text "
-                                "and mathematical expressions in this image exactly as written. "
-                                "Preserve equations, symbols, numbering, and layout. "
-                                "Output ONLY the transcribed content — "
-                                "no commentary, no explanations, no translations."
-                            ),
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": data_url},
-                        },
-                    ],
-                }
-            ],
-        )
-        content = response.choices[0].message.content.strip()
+        resp    = requests.post(TOGETHER_ENDPOINT, json=payload, headers=headers, timeout=90)
+        resp.raise_for_status()
+        content = resp.json()["choices"][0]["message"]["content"].strip()
 
         if any(sig.lower() in content.lower() for sig in _OCR_FAILURE_SIGNALS):
             print(f"[OCR] Suspicious response: {content[:200]}")
@@ -772,6 +777,11 @@ def _ocr_image_bytes(image_bytes: bytes, mime: str) -> str:
 
         print(f"[OCR] Success — extracted {len(content)} characters")
         return content
+
+    except requests.exceptions.HTTPError as e:
+        body = e.response.text[:500] if e.response is not None else ""
+        print(f"[OCR] HTTP error: {body}")
+        return f"❌ OCR request failed: {e} — {body}"
 
     except Exception as e:
         print(f"[OCR] Error: {e}")
