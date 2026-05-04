@@ -724,8 +724,8 @@ def _ocr_image_bytes(image_bytes: bytes, mime: str) -> str:
     }
 
     url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models"
-        f"/gemini-3.0-flash-preview-05-20:generateContent?key={GEMINI_API_KEY}"
+        f"https://generativelanguage.googleapis.com/v1/models"
+        f"/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
     )
 
     print(f"[OCR] Sending {len(image_bytes)} bytes to Gemini Flash")
