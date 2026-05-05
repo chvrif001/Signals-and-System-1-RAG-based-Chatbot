@@ -38,12 +38,6 @@ TOGETHER_API_KEY  = os.environ["TOGETHER_API_KEY"]
 GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY", "")
 ADMIN_USER_ID     = int(os.environ.get("ADMIN_USER_ID", "0"))
 
-# Vision model — using Llama 3.2 Vision via NVIDIA NIM on Together AI
-# Options:
-#   "nim/meta/llama-3.2-11b-vision-instruct"  ← faster
-#   "nim/meta/llama-3.2-90b-vision-instruct"  ← more accurate
-# Vision/OCR is handled by Gemini Flash (see _ocr_image_bytes)
-
 LLM_MODEL    = "meta-llama/Meta-Llama-3-8B-Instruct-Lite"
 
 # ── API endpoints ─────────────────────────────────────────────────────────────
@@ -51,7 +45,6 @@ TOGETHER_ENDPOINT = "https://api.together.xyz/v1/chat/completions"
 
 
 def _get_endpoint(model: str) -> str:
-    """All models, including nim/* prefixed ones, are served via Together AI."""
     return TOGETHER_ENDPOINT
 
 
@@ -104,6 +97,11 @@ a_sym = sp.Symbol("a",     positive=True)
 def _normalise(expr: str) -> str:
     s = expr.strip()
     s = s.replace("^", "**").replace("{", "(").replace("}", ")")
+
+    # FIX 3a — explicit u(t) and u(t±a) shorthand BEFORE the generic u(...) rule
+    s = re.sub(r'\bu\s*\(\s*t\s*\)', 'Heaviside(t)', s)
+    s = re.sub(r'\bu\s*\(\s*t\s*([+-][^)]+)\)', r'Heaviside(t\1)', s)
+
     s = re.sub(r'\bE\*\*(-[^\s\*\+\-\(\),]+)', r'E**(\1)', s)
     s = re.sub(r'\be\*\*(-[^\s\*\+\-\(\),]+)', r'E**(\1)', s)
     s = re.sub(r'(\d)(t\b)',               r'\1*\2', s)
@@ -191,11 +189,18 @@ _VERB_PREFIX = re.compile(
     re.IGNORECASE
 )
 
+# FIX 3b — strip trailing noise phrases that survive prefix removal
+_TRAILING_NOISE = re.compile(
+    r'\s+(?:looks?\s+like|for\s+me|please|now|here|to\s+me|as\s+well)\s*$',
+    re.IGNORECASE
+)
+
 
 def extract_expr(question: str) -> str | None:
     q = question.strip()
     q = _QUESTION_PREFIX.sub('', q).strip()
     q = _VERB_PREFIX.sub('', q).strip()
+    q = _TRAILING_NOISE.sub('', q)      # FIX 3b
     q = q.rstrip("?.")
     if any(c in q for c in _SIGNAL_CHARS):
         return q
@@ -365,7 +370,7 @@ def compute_laplace(expr_str: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FOURIER TRANSFORM
+# FOURIER TRANSFORM  (FIX 2 — direct integration replaces sp.fourier_transform)
 # ══════════════════════════════════════════════════════════════════════════════
 def _identify_fourier_rule(expr: sp.Expr) -> str:
     s = str(expr)
@@ -384,6 +389,51 @@ def _identify_fourier_rule(expr: sp.Expr) -> str:
     return "General definition: F(ω) = ∫₋∞^∞ f(t)e^{-jωt} dt"
 
 
+def _fourier_direct(f: sp.Expr) -> sp.Expr:
+    """
+    Compute F(ω) = ∫_{-∞}^{∞} f(t) e^{-jωt} dt symbolically.
+    Falls back to a table of known pairs for signals that are not L¹-integrable
+    (cos, sin, u(t), constants) which would otherwise return zero.
+    """
+    # Attempt symbolic integration first
+    try:
+        result = sp.integrate(
+            f * sp.exp(-sp.I * w_sym * t_sym),
+            (t_sym, -sp.oo, sp.oo)
+        )
+        if not result.has(sp.Integral):
+            return sp.simplify(result)
+    except Exception:
+        pass
+
+    # Known-pair fallback table
+    s = str(f)
+
+    # cos(w0*t) — purely oscillatory, not L¹
+    if "cos" in s:
+        m = re.search(r'cos\(\s*([^)]+?)\s*\*?\s*t\b', str(f))
+        if m:
+            w0 = sp.sympify(m.group(1).strip(), locals=_COMMON_NS)
+            return sp.pi * (sp.DiracDelta(w_sym - w0) + sp.DiracDelta(w_sym + w0))
+
+    # sin(w0*t)
+    if "sin" in s:
+        m = re.search(r'sin\(\s*([^)]+?)\s*\*?\s*t\b', str(f))
+        if m:
+            w0 = sp.sympify(m.group(1).strip(), locals=_COMMON_NS)
+            return sp.I * sp.pi * (sp.DiracDelta(w_sym + w0) - sp.DiracDelta(w_sym - w0))
+
+    # u(t) = Heaviside(t), no exponential decay
+    if "Heaviside" in s and "exp" not in s:
+        return sp.pi * sp.DiracDelta(w_sym) + 1 / (sp.I * w_sym)
+
+    # constant 1
+    if f == sp.Integer(1):
+        return 2 * sp.pi * sp.DiracDelta(w_sym)
+
+    raise ValueError("No closed-form pair found")
+
+
 def compute_fourier(expr_str: str) -> str:
     lines = ["━━━ 📡 FOURIER TRANSFORM ━━━\n"]
     lines.append(f"Input:  f(t) = {expr_str}\n")
@@ -392,31 +442,35 @@ def compute_fourier(expr_str: str) -> str:
         f = parse_ct_expr(expr_str)
     except Exception as e:
         return (f"❌ Could not parse expression: {e}\n"
-                f"Try: e**(-t)*u(t)  or  cos(2*t)*u(t)")
+                f"Try: e**(-t)*u(t)  or  cos(2*t)")
+
     rule = _identify_fourier_rule(f)
     lines.append(f"Step 1 — Recognise the signal form:\n   → {rule}\n")
+
     args = sp.Add.make_args(f)
     if len(args) > 1:
         lines.append("Step 2 — Apply linearity  F{af + bg} = aF(ω) + bG(ω):")
         for term in args:
             try:
-                r = sp.fourier_transform(term, t_sym, w_sym / (2 * sp.pi), noconds=True)
+                r = _fourier_direct(term)
                 lines.append(f"   F{{{sp.pretty(term)}}} = {sp.pretty(r)}")
             except Exception:
                 lines.append(f"   F{{{sp.pretty(term)}}} = (could not evaluate term)")
         lines.append("")
     else:
         lines.append("Step 2 — Single term, applying transform directly.\n")
+
     try:
-        result = sp.fourier_transform(f, t_sym, w_sym / (2 * sp.pi), noconds=True)
-        result = sp.simplify(result)
+        result = _fourier_direct(f)
         lines.append(f"Step 3 — Final result:\n   F(ω) = {sp.pretty(result)}\n")
-        if "exp" in str(f) and "Heaviside" in str(f):
-            lines.append("Magnitude |F(ω)|: decreases as 1/ω — low-pass character")
+        if "Heaviside" in str(f) and "exp" in str(f):
+            lines.append("Magnitude |F(ω)|: low-pass characteristic — decays as 1/ω")
+        elif "cos" in str(f) or "sin" in str(f):
+            lines.append("Note: Result contains Dirac deltas — spectrum consists of discrete lines.")
         lines.append(f"\n✅  F(ω) = {sp.pretty(result)}")
     except Exception as e:
-        lines.append(f"❌ SymPy could not evaluate: {e}")
-        lines.append("   Tip: make sure causal signals include u(t) / Heaviside(t)")
+        lines.append(f"❌ Could not evaluate: {e}")
+        lines.append("   Tip: for causal signals include u(t), e.g. cos(2*t)*u(t)")
     return "\n".join(lines)
 
 
@@ -677,20 +731,19 @@ async def handle_mark_session(update: Update,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# OCR — Gemini Flash (Google)
+# OCR — Gemini Flash  (FIX 1 — diagram-aware prompt)
 # ══════════════════════════════════════════════════════════════════════════════
-
-
 def _ocr_image_bytes(image_bytes: bytes, mime: str) -> str:
-    """Send image bytes to Gemini Flash and return extracted text."""
-
+    """
+    Send image bytes to Gemini Flash and return extracted text OR a structural
+    description of any drawn diagram found in the image.
+    """
     if not image_bytes or len(image_bytes) < 100:
         return f"❌ OCR failed: image data is empty or too small ({len(image_bytes)} bytes)"
 
     if not GEMINI_API_KEY:
         return "❌ OCR failed: GEMINI_API_KEY environment variable is not set."
 
-    # Normalise mime type
     mime = mime.lower().lstrip(".")
     if mime == "jpg":
         mime = "jpeg"
@@ -699,19 +752,33 @@ def _ocr_image_bytes(image_bytes: bytes, mime: str) -> str:
 
     b64 = base64.b64encode(image_bytes).decode("utf-8")
 
+    # Two-mode prompt: handles handwritten text AND drawn diagrams
+    prompt_text = (
+        "You are an expert at reading handwritten academic work and engineering diagrams.\n\n"
+        "First, determine what this image primarily contains:\n"
+        "  A) HANDWRITTEN TEXT / EQUATIONS — mathematical working, written answers, equations\n"
+        "  B) DRAWN DIAGRAM — block diagram, signal flow graph, circuit, system diagram, "
+        "graph/plot, flowchart, or any drawn structure\n"
+        "  C) BOTH — handwritten text alongside a drawn diagram\n\n"
+        "Then respond accordingly:\n\n"
+        "If A: Transcribe ALL handwritten text and mathematical expressions exactly as written. "
+        "Preserve equations, symbols, numbering, and layout.\n\n"
+        "If B: Describe the diagram STRUCTURALLY in detail:\n"
+        "  - What type of diagram is it? (block diagram, signal flow graph, etc.)\n"
+        "  - List every block/node with its label\n"
+        "  - List every connection/arrow: from → to, and any label on the connection\n"
+        "  - Note any summing junctions, branch points, or special symbols\n"
+        "  - State any transfer functions, gains, or labels shown\n"
+        "  - Identify input(s) and output(s)\n\n"
+        "If C: Do both — transcribe the text first, then describe the diagram structure.\n\n"
+        "Output ONLY the transcribed/described content. No commentary, no preamble."
+    )
+
     payload = {
         "contents": [
             {
                 "parts": [
-                    {
-                        "text": (
-                            "You are an OCR assistant. Transcribe ALL handwritten text "
-                            "and mathematical expressions in this image exactly as written. "
-                            "Preserve equations, symbols, numbering, and layout. "
-                            "Output ONLY the transcribed content — "
-                            "no commentary, no explanations, no translations."
-                        )
-                    },
+                    {"text": prompt_text},
                     {
                         "inline_data": {
                             "mime_type": f"image/{mime}",
@@ -971,7 +1038,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "   _fourier series of t, T=2_\n\n"
         "🔁 *Convolution*\n"
         "   _convolve u(t) with e^(-t)*u(t)_\n\n"
-        "📷 *Upload a photo* — send handwritten work\n"
+        "📷 *Upload a photo* — send handwritten work or diagrams\n"
         "   With caption → I do what you ask\n"
         "   No caption   → compared to a loaded memo\n\n"
         "📄 *Upload a PDF or image* — question paper, memo, textbook\n"
@@ -995,7 +1062,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "4️⃣ *Convolution*\n"
         "   _convolve e^(-t)*u(t) with u(t)_\n\n"
         "5️⃣ *Plot signals*\n"
-        "   Continuous: _plot 2*u(t-2)_\n"
+        "   Continuous: _plot 2*u(t-2)_  or  _show me what u(t) looks like_\n"
         "   Discrete:   _draw u[n]-u[n-3]_\n\n"
         "6️⃣ *Upload a PDF or image file*\n"
         "   Send the file → bot loads it as session context\n"
@@ -1004,9 +1071,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "     _mark my work against this memo_\n"
         "     _explain what question 3 is asking_\n"
         "   ⚠️ Uploaded files are session-only — not saved permanently.\n\n"
-        "7️⃣ *Handwritten photo*\n"
+        "7️⃣ *Handwritten photo or diagram*\n"
         "   📌 With caption → bot follows your instruction\n"
-        "   📌 No caption   → compared against loaded session memo\n\n"
+        "   📌 No caption   → compared against loaded session memo\n"
+        "   📌 Diagrams (block diagrams, signal flow graphs) are described structurally\n\n"
         "8️⃣ *Mark calculator*\n"
         "   _how much do I need to pass_\n\n"
         "💡 Use * for multiply, ** for power\n"
@@ -1122,7 +1190,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(
                 "⚠️ Could not parse that expression.\n"
-                "Examples:\n  _plot 2*u(t-2)_\n  _draw u[n] - u[n-3]_",
+                "Examples:\n  _plot 2*u(t-2)_\n  _draw u[n] - u[n-3]_\n"
+                "  _show me what u(t) looks like_",
                 parse_mode="Markdown")
         return
 
@@ -1147,7 +1216,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
     await update.message.reply_text(
-        "📷 Got your photo — running handwriting recognition… (~15–30s)")
+        "📷 Got your photo — running handwriting/diagram recognition… (~15–30s)")
 
     import io
     photo_file  = await update.message.photo[-1].get_file()
@@ -1158,7 +1227,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     extracted = _ocr_image_bytes(image_bytes, "jpeg")
     await update.message.reply_text(
-        f"📝 Extracted handwriting:\n\n{extracted}")
+        f"📝 Extracted content:\n\n{extracted}")
 
     sess = session_get(chat_id)
 
@@ -1197,12 +1266,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "else you'd like me to do.",
                 parse_mode="Markdown")
         else:
-            session_store(chat_id, extracted, "Handwritten photo")
+            session_store(chat_id, extracted, "Handwritten photo / diagram")
             await update.message.reply_text(
                 "Photo loaded. What would you like me to do?\n"
                 "  • _Solve this_\n"
                 "  • _Explain step by step_\n"
-                "  • _What is this question asking?_")
+                "  • _What is this question asking?_\n"
+                "  • _Describe this diagram_")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
