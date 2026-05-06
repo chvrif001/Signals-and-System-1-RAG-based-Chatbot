@@ -98,7 +98,7 @@ def _normalise(expr: str) -> str:
     s = expr.strip()
     s = s.replace("^", "**").replace("{", "(").replace("}", ")")
 
-    # FIX 3a — explicit u(t) and u(t±a) shorthand BEFORE the generic u(...) rule
+    # explicit u(t) and u(t±a) shorthand BEFORE the generic u(...) rule
     s = re.sub(r'\bu\s*\(\s*t\s*\)', 'Heaviside(t)', s)
     s = re.sub(r'\bu\s*\(\s*t\s*([+-][^)]+)\)', r'Heaviside(t\1)', s)
 
@@ -189,7 +189,6 @@ _VERB_PREFIX = re.compile(
     re.IGNORECASE
 )
 
-# FIX 3b — strip trailing noise phrases that survive prefix removal
 _TRAILING_NOISE = re.compile(
     r'\s+(?:looks?\s+like|for\s+me|please|now|here|to\s+me|as\s+well)\s*$',
     re.IGNORECASE
@@ -200,7 +199,7 @@ def extract_expr(question: str) -> str | None:
     q = question.strip()
     q = _QUESTION_PREFIX.sub('', q).strip()
     q = _VERB_PREFIX.sub('', q).strip()
-    q = _TRAILING_NOISE.sub('', q)      # FIX 3b
+    q = _TRAILING_NOISE.sub('', q)
     q = q.rstrip("?.")
     if any(c in q for c in _SIGNAL_CHARS):
         return q
@@ -209,6 +208,260 @@ def extract_expr(question: str) -> str | None:
     if re.search(r'\be\b', q):
         return q
     return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LATEX MATH RENDERER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _sympy_to_latex(expr: sp.Expr) -> str:
+    """Convert a SymPy expression to a LaTeX string."""
+    return sp.latex(expr)
+
+
+def _render_math_png(title: str, steps: list[tuple[str, str]], msg_id: int) -> str | None:
+    """
+    Render a list of (label, latex_expr) pairs as a clean PNG using Matplotlib's
+    built-in mathtext renderer (no external LaTeX installation required).
+
+    steps example:
+        [
+            ("Input",      r"f(t) = e^{-t} u(t)"),
+            ("Definition", r"F(s) = \int_0^{\infty} f(t)\,e^{-st}\,dt"),
+            ("Result",     r"F(s) = \frac{1}{s+1}"),
+        ]
+    Returns the file path or None on failure.
+    """
+    try:
+        n      = len(steps)
+        fig_h  = max(2.0, 0.75 * n + 1.2)
+        fig, ax = plt.subplots(figsize=(11, fig_h), facecolor="white")
+        ax.set_facecolor("white")
+        ax.axis("off")
+
+        # ── Title bar ────────────────────────────────────────────────────────
+        ax.text(0.5, 0.98, title,
+                transform=ax.transAxes,
+                fontsize=15, fontweight="bold",
+                ha="center", va="top", color="#1a1a2e")
+
+        # ── Horizontal rule under title ───────────────────────────────────────
+        ax.axhline(y=0.94, xmin=0.02, xmax=0.98,
+                   color="#cccccc", linewidth=0.8,
+                   transform=ax.transAxes)
+
+        # ── Steps ─────────────────────────────────────────────────────────────
+        y         = 0.90
+        step_gap  = 0.88 / max(n, 1)
+        label_col = "#0077b6"
+        expr_col  = "#000000"
+
+        for label, expr_latex in steps:
+            # Label (bold, coloured)
+            ax.text(0.03, y, f"{label}:",
+                    transform=ax.transAxes,
+                    fontsize=11, fontweight="bold",
+                    color=label_col, va="top", ha="left")
+
+            # Expression — wrap in $…$ for mathtext rendering
+            if expr_latex:
+                # Escape any stray percent signs that break mathtext
+                safe = expr_latex.replace("%", r"\%")
+                try:
+                    ax.text(0.22, y, f"${safe}$",
+                            transform=ax.transAxes,
+                            fontsize=12, color=expr_col,
+                            va="top", ha="left",
+                            usetex=False)   # use Matplotlib mathtext, not pdflatex
+                except Exception:
+                    # Fallback: plain text if mathtext chokes on unusual symbols
+                    ax.text(0.22, y, expr_latex,
+                            transform=ax.transAxes,
+                            fontsize=11, color=expr_col,
+                            va="top", ha="left", fontfamily="monospace")
+
+            y -= step_gap
+
+        fig.tight_layout(pad=0.5)
+        path = os.path.join(PLOT_FOLDER, f"math_{msg_id}.png")
+        fig.savefig(path, dpi=170, bbox_inches="tight",
+                    facecolor="white", edgecolor="none")
+        plt.close("all")
+        return path
+    except Exception as e:
+        print(f"[_render_math_png] {e}")
+        plt.close("all")
+        return None
+
+
+# ── Per-operation step builders ───────────────────────────────────────────────
+
+def _build_laplace_steps(expr_str: str) -> tuple[list[tuple[str, str]], str]:
+    """Returns (steps, error_string). steps is empty on error."""
+    steps: list[tuple[str, str]] = []
+    try:
+        f      = parse_ct_expr(expr_str)
+        f_tex  = _sympy_to_latex(f)
+        steps.append(("Input",      rf"f(t) = {f_tex}"))
+        steps.append(("Definition", r"F(s) = \int_{0}^{\infty} f(t)\,e^{-st}\,dt"))
+
+        rule = _identify_laplace_rule(f)
+        steps.append(("Rule / Form", rule))
+
+        args = sp.Add.make_args(f)
+        if len(args) > 1:
+            partial = []
+            for term in args:
+                try:
+                    r = sp.laplace_transform(term, t_sym, s_sym, noconds=True)
+                    partial.append(
+                        rf"\mathcal{{L}}\{{{_sympy_to_latex(term)}\}} = {_sympy_to_latex(r)}"
+                    )
+                except Exception:
+                    pass
+            if partial:
+                steps.append(("Linearity", r"\quad+\quad".join(partial)))
+
+        result     = sp.laplace_transform(f, t_sym, s_sym, noconds=True)
+        result     = sp.simplify(result)
+        result_tex = _sympy_to_latex(result)
+        steps.append(("Result", rf"F(s) = {result_tex}"))
+
+        if "exp" in str(f):
+            steps.append(("ROC", r"\mathrm{Re}(s) > -a"))
+        elif "Heaviside" in str(f):
+            steps.append(("ROC", r"\mathrm{Re}(s) > 0"))
+
+        return steps, ""
+    except Exception as e:
+        return [], f"❌ Could not compute Laplace transform: {e}"
+
+
+def _build_fourier_steps(expr_str: str) -> tuple[list[tuple[str, str]], str]:
+    steps: list[tuple[str, str]] = []
+    try:
+        f      = parse_ct_expr(expr_str)
+        f_tex  = _sympy_to_latex(f)
+        steps.append(("Input",      rf"f(t) = {f_tex}"))
+        steps.append(("Definition", r"F(\omega)=\int_{-\infty}^{\infty}f(t)\,e^{-j\omega t}\,dt"))
+
+        rule = _identify_fourier_rule(f)
+        steps.append(("Rule / Form", rule))
+
+        args = sp.Add.make_args(f)
+        if len(args) > 1:
+            partial = []
+            for term in args:
+                try:
+                    r = _fourier_direct(term)
+                    partial.append(
+                        rf"\mathcal{{F}}\{{{_sympy_to_latex(term)}\}} = {_sympy_to_latex(r)}"
+                    )
+                except Exception:
+                    pass
+            if partial:
+                steps.append(("Linearity", r"\quad+\quad".join(partial)))
+
+        result     = _fourier_direct(f)
+        result_tex = _sympy_to_latex(result)
+        steps.append(("Result", rf"F(\omega) = {result_tex}"))
+
+        if "Heaviside" in str(f) and "exp" in str(f):
+            steps.append(("Note", r"|\,F(\omega)\,| \text{ is low-pass; decays as } 1/\omega"))
+        elif "cos" in str(f) or "sin" in str(f):
+            steps.append(("Note", r"\text{Spectrum consists of discrete Dirac lines}"))
+
+        return steps, ""
+    except Exception as e:
+        return [], f"❌ Could not compute Fourier transform: {e}"
+
+
+def _build_fourier_series_steps(expr_str: str, period: float,
+                                 n_terms: int = 5) -> tuple[list[tuple[str, str]], str]:
+    steps: list[tuple[str, str]] = []
+    try:
+        f     = parse_ct_expr(expr_str)
+        f_tex = _sympy_to_latex(f)
+        T     = sp.Rational(period).limit_denominator(1000)
+        w0    = 2 * sp.pi / T
+        w0_tex = _sympy_to_latex(w0)
+
+        steps.append(("Input",  rf"f(t) = {f_tex},\quad T = {_sympy_to_latex(T)}"))
+        steps.append(("Fund. freq.", rf"\omega_0 = \frac{{2\pi}}{{T}} = {w0_tex}\ \mathrm{{rad/s}}"))
+        steps.append(("Coefficients",
+                       r"a_0=\frac{1}{T}\int_0^T f(t)\,dt,\quad"
+                       r"a_n=\frac{2}{T}\int_0^T f(t)\cos(n\omega_0 t)\,dt,\quad"
+                       r"b_n=\frac{2}{T}\int_0^T f(t)\sin(n\omega_0 t)\,dt"))
+
+        a0     = sp.simplify(sp.integrate(f, (t_sym, 0, T)) / T)
+        steps.append(("a₀ (DC)", rf"a_0 = {_sympy_to_latex(a0)}"))
+
+        for k in range(1, n_terms + 1):
+            try:
+                an = sp.simplify(
+                    2 * sp.integrate(f * sp.cos(k * w0 * t_sym), (t_sym, 0, T)) / T)
+                bn = sp.simplify(
+                    2 * sp.integrate(f * sp.sin(k * w0 * t_sym), (t_sym, 0, T)) / T)
+                steps.append((
+                    f"n = {k}",
+                    rf"a_{{{k}}}={_sympy_to_latex(an)},\quad b_{{{k}}}={_sympy_to_latex(bn)}"
+                ))
+            except Exception:
+                steps.append((f"n = {k}", r"\text{could not evaluate}"))
+
+        try:
+            series = sp.fourier_series(f, (t_sym, 0, T))
+            trunc  = series.truncate(n_terms)
+            steps.append(("Truncated series",
+                           rf"f(t)\approx {_sympy_to_latex(trunc)}"))
+        except Exception:
+            pass
+
+        return steps, ""
+    except Exception as e:
+        return [], f"❌ Could not compute Fourier series: {e}"
+
+
+def _build_convolution_steps(expr1_str: str, expr2_str: str,
+                              msg_id: int) -> tuple[list[tuple[str, str]], str, str | None]:
+    """Returns (steps, error_string, plot_path)."""
+    steps: list[tuple[str, str]] = []
+    plot_path = None
+    try:
+        f = parse_ct_expr(expr1_str)
+        g = parse_ct_expr(expr2_str)
+    except Exception as e:
+        return [], f"❌ Could not parse signals: {e}", None
+
+    steps.append(("f(t)",       _sympy_to_latex(f)))
+    steps.append(("g(t)",       _sympy_to_latex(g)))
+    steps.append(("Definition", r"(f\star g)(t)=\int_{-\infty}^{\infty}f(\tau)\,g(t-\tau)\,d\tau"))
+
+    f_tau   = f.subs(t_sym, tau)
+    g_shift = g.subs(t_sym, t_sym - tau)
+    integrand = sp.expand(f_tau * g_shift)
+
+    steps.append(("Substitution",
+                   rf"f(\tau)={_sympy_to_latex(f_tau)},\quad g(t-\tau)={_sympy_to_latex(g_shift)}"))
+    steps.append(("Integrand",   _sympy_to_latex(integrand)))
+
+    both_causal = ("Heaviside" in str(f) or str(f) == str(sp.Heaviside(t_sym))) and \
+                  ("Heaviside" in str(g) or str(g) == str(sp.Heaviside(t_sym)))
+    limits = (tau, 0, t_sym) if both_causal else (tau, -sp.oo, sp.oo)
+
+    try:
+        result = sp.integrate(integrand, limits)
+        result = sp.simplify(result)
+        if result.has(sp.Integral):
+            raise ValueError("unevaluated integral")
+        steps.append(("Result", rf"(f\star g)(t) = {_sympy_to_latex(result)}"))
+        plot_path = _numerical_convolution_plot(f, g, msg_id)
+    except Exception as e:
+        steps.append(("Note", rf"\text{{Symbolic integration failed: {str(e)[:60]}}}"))
+        steps.append(("Fallback", r"\text{See numerical plot}"))
+        plot_path = _numerical_convolution_plot(f, g, msg_id)
+
+    return steps, "", plot_path
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -315,23 +568,24 @@ def generate_plot(question: str, msg_id: int) -> str | None:
 def _identify_laplace_rule(expr: sp.Expr) -> str:
     s = str(expr)
     if "DiracDelta" in s:
-        return "Unit impulse:   L{δ(t)} = 1"
+        return r"\mathcal{L}\{\delta(t)\} = 1"
     if "Heaviside" in s and "exp" not in s and "sin" not in s and "cos" not in s:
-        return "Unit step:      L{u(t)} = 1/s"
+        return r"\mathcal{L}\{u(t)\} = \frac{1}{s}"
     if "exp" in s and "sin" not in s and "cos" not in s:
-        return "Damped exponential: L{e^{-at}f(t)} = F(s+a)"
+        return r"\mathcal{L}\{e^{-at}f(t)\} = F(s+a)"
     if "sin" in s:
-        return "Sine:           L{sin(ωt)u(t)} = ω/(s²+ω²)"
+        return r"\mathcal{L}\{\sin(\omega t)\,u(t)\} = \frac{\omega}{s^2+\omega^2}"
     if "cos" in s:
-        return "Cosine:         L{cos(ωt)u(t)} = s/(s²+ω²)"
+        return r"\mathcal{L}\{\cos(\omega t)\,u(t)\} = \frac{s}{s^2+\omega^2}"
     if str(expr) == str(t_sym):
-        return "Ramp:           L{t·u(t)} = 1/s²"
+        return r"\mathcal{L}\{t\,u(t)\} = \frac{1}{s^2}"
     if expr == sp.Integer(1):
-        return "Impulse (constant 1): L{δ(t)} = 1"
-    return "General transform pair / integration by parts"
+        return r"\mathcal{L}\{\delta(t)\} = 1"
+    return r"\text{General transform pair / integration by parts}"
 
 
 def compute_laplace(expr_str: str) -> str:
+    """Kept as plain-text fallback."""
     lines = ["━━━ 📐 LAPLACE TRANSFORM ━━━\n"]
     lines.append(f"Input:  f(t) = {expr_str}\n")
     lines.append("Definition:  F(s) = ∫₀^∞  f(t) · e^(-st) dt\n")
@@ -370,32 +624,30 @@ def compute_laplace(expr_str: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FOURIER TRANSFORM  (FIX 2 — direct integration replaces sp.fourier_transform)
+# FOURIER TRANSFORM
 # ══════════════════════════════════════════════════════════════════════════════
 def _identify_fourier_rule(expr: sp.Expr) -> str:
     s = str(expr)
     if "DiracDelta" in s:
-        return "Impulse:   F{δ(t)} = 1"
+        return r"\mathcal{F}\{\delta(t)\} = 1"
     if "Heaviside" in s and "exp" not in s:
-        return "Step:      F{u(t)} = πδ(ω) + 1/jω"
+        return r"\mathcal{F}\{u(t)\} = \pi\delta(\omega) + \frac{1}{j\omega}"
     if "exp" in s and "sin" not in s and "cos" not in s:
-        return "Damped exp: F{e^{-at}u(t)} = 1/(a+jω)  [a>0]"
+        return r"\mathcal{F}\{e^{-at}u(t)\} = \frac{1}{a+j\omega},\quad a>0"
     if "sin" in s:
-        return "Sine:      F{sin(ω₀t)} = jπ[δ(ω+ω₀)−δ(ω−ω₀)]"
+        return r"\mathcal{F}\{\sin(\omega_0 t)\} = j\pi[\delta(\omega+\omega_0)-\delta(\omega-\omega_0)]"
     if "cos" in s:
-        return "Cosine:    F{cos(ω₀t)} = π[δ(ω+ω₀)+δ(ω−ω₀)]"
+        return r"\mathcal{F}\{\cos(\omega_0 t)\} = \pi[\delta(\omega+\omega_0)+\delta(\omega-\omega_0)]"
     if expr == sp.Integer(1):
-        return "Constant 1: F{1} = 2πδ(ω)"
-    return "General definition: F(ω) = ∫₋∞^∞ f(t)e^{-jωt} dt"
+        return r"\mathcal{F}\{1\} = 2\pi\delta(\omega)"
+    return r"\text{General definition: direct integration}"
 
 
 def _fourier_direct(f: sp.Expr) -> sp.Expr:
     """
     Compute F(ω) = ∫_{-∞}^{∞} f(t) e^{-jωt} dt symbolically.
-    Falls back to a table of known pairs for signals that are not L¹-integrable
-    (cos, sin, u(t), constants) which would otherwise return zero.
+    Falls back to a table of known pairs for non-L¹-integrable signals.
     """
-    # Attempt symbolic integration first
     try:
         result = sp.integrate(
             f * sp.exp(-sp.I * w_sym * t_sym),
@@ -406,28 +658,23 @@ def _fourier_direct(f: sp.Expr) -> sp.Expr:
     except Exception:
         pass
 
-    # Known-pair fallback table
     s = str(f)
 
-    # cos(w0*t) — purely oscillatory, not L¹
     if "cos" in s:
         m = re.search(r'cos\(\s*([^)]+?)\s*\*?\s*t\b', str(f))
         if m:
             w0 = sp.sympify(m.group(1).strip(), locals=_COMMON_NS)
             return sp.pi * (sp.DiracDelta(w_sym - w0) + sp.DiracDelta(w_sym + w0))
 
-    # sin(w0*t)
     if "sin" in s:
         m = re.search(r'sin\(\s*([^)]+?)\s*\*?\s*t\b', str(f))
         if m:
             w0 = sp.sympify(m.group(1).strip(), locals=_COMMON_NS)
             return sp.I * sp.pi * (sp.DiracDelta(w_sym + w0) - sp.DiracDelta(w_sym - w0))
 
-    # u(t) = Heaviside(t), no exponential decay
     if "Heaviside" in s and "exp" not in s:
         return sp.pi * sp.DiracDelta(w_sym) + 1 / (sp.I * w_sym)
 
-    # constant 1
     if f == sp.Integer(1):
         return 2 * sp.pi * sp.DiracDelta(w_sym)
 
@@ -435,6 +682,7 @@ def _fourier_direct(f: sp.Expr) -> sp.Expr:
 
 
 def compute_fourier(expr_str: str) -> str:
+    """Kept as plain-text fallback."""
     lines = ["━━━ 📡 FOURIER TRANSFORM ━━━\n"]
     lines.append(f"Input:  f(t) = {expr_str}\n")
     lines.append("Definition:  F(ω) = ∫₋∞^∞  f(t) · e^(-jωt) dt\n")
@@ -489,6 +737,7 @@ def _extract_period(text: str) -> float | None:
 
 
 def compute_fourier_series(expr_str: str, period: float, n_terms: int = 5) -> str:
+    """Kept as plain-text fallback."""
     lines = ["━━━ 🎵 FOURIER SERIES ━━━\n"]
     lines.append(f"Input:   f(t) = {expr_str}")
     lines.append(f"Period:  T = {period:.4g}\n")
@@ -577,6 +826,7 @@ def _numerical_convolution_plot(f_expr: sp.Expr, g_expr: sp.Expr,
 
 
 def compute_convolution(expr1_str: str, expr2_str: str, msg_id: int = 0):
+    """Kept as plain-text fallback."""
     lines = ["━━━ 🔁 CONVOLUTION ━━━\n"]
     lines.append(f"f(t) = {expr1_str}")
     lines.append(f"g(t) = {expr2_str}\n")
@@ -731,13 +981,9 @@ async def handle_mark_session(update: Update,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# OCR — Gemini Flash  (FIX 1 — diagram-aware prompt)
+# OCR — Gemini Flash
 # ══════════════════════════════════════════════════════════════════════════════
 def _ocr_image_bytes(image_bytes: bytes, mime: str) -> str:
-    """
-    Send image bytes to Gemini Flash and return extracted text OR a structural
-    description of any drawn diagram found in the image.
-    """
     if not image_bytes or len(image_bytes) < 100:
         return f"❌ OCR failed: image data is empty or too small ({len(image_bytes)} bytes)"
 
@@ -752,7 +998,6 @@ def _ocr_image_bytes(image_bytes: bytes, mime: str) -> str:
 
     b64 = base64.b64encode(image_bytes).decode("utf-8")
 
-    # Two-mode prompt: handles handwritten text AND drawn diagrams
     prompt_text = (
         "You are an expert at reading handwritten academic work and engineering diagrams.\n\n"
         "First, determine what this image primarily contains:\n"
@@ -814,10 +1059,6 @@ def _ocr_image_bytes(image_bytes: bytes, mime: str) -> str:
 
 
 def _extract_pdf_bytes(pdf_bytes: bytes) -> str:
-    """
-    Extract text from PDF bytes using pypdf.
-    Runs entirely in memory — never touches the knowledge base.
-    """
     import io
     try:
         from pypdf import PdfReader
@@ -886,7 +1127,6 @@ def _prompt_explain(doc_text: str, question: str) -> str:
 
 
 def _call_llm(prompt: str, max_tokens: int = 1500) -> str:
-    """Direct Together AI call — independent of the RAG chain."""
     payload = {
         "model": LLM_MODEL,
         "max_tokens": max_tokens,
@@ -1126,6 +1366,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── 3. Math tools ─────────────────────────────────────────────────────────
+
+    # ── Laplace ───────────────────────────────────────────────────────────────
     if is_laplace(q_lower):
         expr_str = extract_expr(question)
         if not expr_str:
@@ -1134,9 +1376,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "  _laplace of e^(-2*t)*u(t)_", parse_mode="Markdown")
             return
         await update.message.reply_text("⏳ Computing Laplace transform…")
-        await send_long_code(update, compute_laplace(expr_str))
+        steps, err = _build_laplace_steps(expr_str)
+        if err:
+            await update.message.reply_text(err)
+        else:
+            png = _render_math_png("📐 Laplace Transform", steps, msg_id)
+            if png and os.path.exists(png):
+                await update.message.reply_photo(
+                    photo=open(png, "rb"),
+                    caption=f"Laplace Transform of  f(t) = {expr_str}")
+            else:
+                # Fallback to plain text
+                await send_long_code(update, compute_laplace(expr_str))
         return
 
+    # ── Fourier Transform ─────────────────────────────────────────────────────
     if is_fourier(q_lower):
         expr_str = extract_expr(question)
         if not expr_str:
@@ -1145,9 +1399,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "  _fourier transform of e^(-t)*u(t)_", parse_mode="Markdown")
             return
         await update.message.reply_text("⏳ Computing Fourier transform…")
-        await send_long_code(update, compute_fourier(expr_str))
+        steps, err = _build_fourier_steps(expr_str)
+        if err:
+            await update.message.reply_text(err)
+        else:
+            png = _render_math_png("📡 Fourier Transform", steps, msg_id)
+            if png and os.path.exists(png):
+                await update.message.reply_photo(
+                    photo=open(png, "rb"),
+                    caption=f"Fourier Transform of  f(t) = {expr_str}")
+            else:
+                await send_long_code(update, compute_fourier(expr_str))
         return
 
+    # ── Fourier Series ────────────────────────────────────────────────────────
     if is_fs(q_lower):
         period = _extract_period(question)
         if not period:
@@ -1161,9 +1426,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             expr_str = extract_expr(expr_str) or expr_str
         await update.message.reply_text(
             f"⏳ Computing Fourier series for f(t)={expr_str}, T={period:.4g}…")
-        await send_long_code(update, compute_fourier_series(expr_str, period))
+        steps, err = _build_fourier_series_steps(expr_str, period)
+        if err:
+            await update.message.reply_text(err)
+        else:
+            png = _render_math_png("🎵 Fourier Series", steps, msg_id)
+            if png and os.path.exists(png):
+                await update.message.reply_photo(
+                    photo=open(png, "rb"),
+                    caption=f"Fourier Series of  f(t) = {expr_str},  T = {period:.4g}")
+            else:
+                await send_long_code(update, compute_fourier_series(expr_str, period))
         return
 
+    # ── Convolution ───────────────────────────────────────────────────────────
     if is_conv(q_lower):
         e1, e2 = _parse_two_signals(question)
         if not (e1 and e2):
@@ -1173,14 +1449,27 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await update.message.reply_text(
             f"⏳ Computing convolution of  f(t)={e1}  and  g(t)={e2}…")
-        text_result, plot_path = compute_convolution(e1, e2, msg_id)
-        await send_long_code(update, text_result)
-        if plot_path and os.path.exists(plot_path):
-            await update.message.reply_photo(
-                photo=open(plot_path, "rb"),
-                caption="📊 Numerical convolution (f ★ g)(t)")
+        steps, err, plot_path = _build_convolution_steps(e1, e2, msg_id)
+        if err:
+            await update.message.reply_text(err)
+        else:
+            png = _render_math_png("🔁 Convolution  (f ★ g)(t)", steps, msg_id)
+            if png and os.path.exists(png):
+                await update.message.reply_photo(
+                    photo=open(png, "rb"),
+                    caption=f"Convolution:  f(t)={e1}  ★  g(t)={e2}")
+            else:
+                text_result, plot_path2 = compute_convolution(e1, e2, msg_id)
+                await send_long_code(update, text_result)
+                plot_path = plot_path or plot_path2
+            # Always attach numerical plot if available
+            if plot_path and os.path.exists(plot_path):
+                await update.message.reply_photo(
+                    photo=open(plot_path, "rb"),
+                    caption="📊 Numerical convolution  (f ★ g)(t)")
         return
 
+    # ── Plot ──────────────────────────────────────────────────────────────────
     if is_plot(q_lower):
         await update.message.reply_text("📊 Generating plot…")
         fig_path = generate_plot(question, msg_id)
@@ -1279,11 +1568,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # DOCUMENT HANDLER
 # ══════════════════════════════════════════════════════════════════════════════
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Any user may upload a file (PDF or image) as temporary session context.
-    The file is read into memory and then discarded — it is NEVER written to
-    PDF_FOLDER, CHROMA_DIR, or any other persistent location.
-    """
     doc       = update.message.document
     caption   = (update.message.caption or "").strip()
     chat_id   = update.effective_chat.id
