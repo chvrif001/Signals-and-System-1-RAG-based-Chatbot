@@ -219,96 +219,109 @@ def _sympy_to_latex(expr: sp.Expr) -> str:
     return sp.latex(expr)
 
 
+# ── mathtext sanitiser (Matplotlib mathtext subset) ───────────────────────────
+def _sanitise_mathtext(s: str) -> str:
+    """
+    Convert full LaTeX to the subset supported by Matplotlib mathtext.
+    Key restrictions: no \\mathcal, no \\operatorname, no \\text with spaces,
+    no \\left/\\right (optional but sometimes breaks), no \\,
+    """
+    # \mathcal{X} → script-like bold
+    s = re.sub(r'\\mathcal\{([^}]+)\}', r'\\mathbf{\1}', s)
+    # \mathrm{…} → roman (supported in mathtext)
+    s = re.sub(r'\\mathrm\{([^}]+)\}', r'\\rm \1', s)
+    # \operatorname{…} → plain
+    s = re.sub(r'\\operatorname\{([^}]+)\}', r'\\mathrm{\1}', s)
+    # \text{…} → strip braces, keep content
+    s = re.sub(r'\\text\{([^}]*)\}', r'\\mathrm{\1}', s)
+    # \quad / \qquad → spaces
+    s = s.replace(r'\qquad', r'\ \ \ \ ')
+    s = s.replace(r'\quad',  r'\ \ ')
+    # thin space \, → single space
+    s = s.replace(r'\,', r'\ ')
+    # \left and \right are optional decorators — remove them (keep the bracket)
+    s = re.sub(r'\\left\s*',  '', s)
+    s = re.sub(r'\\right\s*', '', s)
+    return s
+
+
+def _try_render_row(ax, x_label: float, x_expr: float, y: float,
+                    label: str, latex_str: str, fontsize: int = 13) -> float:
+    """
+    Draw one label + expression row on `ax`.
+    Returns the height consumed (in axes-fraction units).
+    Tries mathtext first; falls back to a pretty-printed monospace string.
+    """
+    label_col = "#0055aa"
+    ax.text(x_label, y, f"{label}:",
+            transform=ax.transAxes,
+            fontsize=fontsize - 1, fontweight="bold",
+            color=label_col, va="top", ha="left", usetex=False)
+
+    if not latex_str:
+        return 0.07
+
+    safe = _sanitise_mathtext(latex_str)
+    try:
+        ax.text(x_expr, y, f"${safe}$",
+                transform=ax.transAxes,
+                fontsize=fontsize, color="#111111",
+                va="top", ha="left", usetex=False)
+    except Exception:
+        # Absolute fallback: monospace plain text
+        ax.text(x_expr, y, latex_str,
+                transform=ax.transAxes,
+                fontsize=fontsize - 2, color="#111111",
+                va="top", ha="left", fontfamily="monospace", usetex=False)
+    return 0.07
+
+
 def _render_math_png(title: str, steps: list[tuple[str, str]], msg_id: int) -> str | None:
     """
-    Render a list of (label, latex_expr) pairs as a clean PNG using Matplotlib's
-    built-in mathtext renderer.
-
-    NOTE: Matplotlib mathtext does NOT support all LaTeX commands.
-    Supported: fractions, Greek letters, sub/superscripts, integrals, sum, sqrt.
-    NOT supported: \\mathcal, \\mathbb, \\mathrm (mostly), \\text (partially).
-    We sanitise the LaTeX strings before rendering.
+    Render a list of (label, latex_expr) pairs as a clean PNG.
+    Each step gets its own row.  Uses Matplotlib mathtext (no pdflatex needed).
     """
-
-    def _sanitise(s: str) -> str:
-        """Replace unsupported mathtext commands with renderable equivalents."""
-        s = s.replace(r"\mathcal{L}", r"\mathscr{L}")   # fallback glyph
-        s = s.replace(r"\mathcal{F}", r"\mathscr{F}")
-        # mathscr also not in mathtext — use bold italic instead
-        s = re.sub(r'\\mathcal\{([^}]+)\}', r'\mathbf{\1}', s)
-        s = re.sub(r'\\mathscr\{([^}]+)\}', r'\mathbf{\1}', s)
-        s = re.sub(r'\\mathrm\{([^}]+)\}', r'\rm \1', s)
-        # \text{…} → plain text via \rm
-        s = re.sub(r'\\text\{([^}]*)\}', r'\1', s)
-        # \quad → space
-        s = s.replace(r"\quad", r"\ \ ")
-        return s
-
     try:
-        n      = len(steps)
-        fig_h  = max(2.2, 0.80 * n + 1.2)
-        fig, ax = plt.subplots(figsize=(12, fig_h), facecolor="white")
+        n       = len(steps)
+        row_h   = 0.072          # axes-fraction per row
+        fig_h   = max(2.5, n * row_h * 14 + 1.6)   # inches
+        fig_w   = 13.0
+
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h), facecolor="white")
         ax.set_facecolor("white")
         ax.axis("off")
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
 
-        # ── Title bar ────────────────────────────────────────────────────────
-        ax.text(0.5, 0.98, title,
+        # ── Title ──────────────────────────────────────────────────────────
+        ax.text(0.5, 0.97, title,
                 transform=ax.transAxes,
-                fontsize=15, fontweight="bold",
-                ha="center", va="top", color="#1a1a2e")
+                fontsize=16, fontweight="bold",
+                ha="center", va="top", color="#1a1a2e", usetex=False)
 
-        # ── Horizontal rule under title ───────────────────────────────────────
-        line = plt.Line2D([0.02, 0.98], [0.93, 0.93],
-                          transform=ax.transAxes,
-                          color="#cccccc", linewidth=0.8)
-        ax.add_line(line)
+        # ── Divider ────────────────────────────────────────────────────────
+        ax.axhline(y=0.92, xmin=0.01, xmax=0.99,
+                   color="#aaaaaa", linewidth=1.0,
+                   transform=ax.transAxes)
 
-        # ── Steps ─────────────────────────────────────────────────────────────
-        y        = 0.89
-        step_gap = 0.86 / max(n, 1)
-        label_col = "#0077b6"
+        # ── Rows ───────────────────────────────────────────────────────────
+        y = 0.90
+        for label, latex_str in steps:
+            _try_render_row(ax, 0.01, 0.22, y, label, latex_str, fontsize=13)
+            y -= row_h
+            if y < 0.02:          # safety: don't overflow the axes
+                break
 
-        for label, expr_latex in steps:
-            # Label (bold, coloured) — plain text, no mathtext
-            ax.text(0.02, y, f"{label}:",
-                    transform=ax.transAxes,
-                    fontsize=10, fontweight="bold",
-                    color=label_col, va="top", ha="left",
-                    usetex=False)
-
-            if expr_latex:
-                safe = _sanitise(expr_latex)
-                rendered = False
-                # Try mathtext rendering
-                try:
-                    ax.text(0.20, y, f"${safe}$",
-                            transform=ax.transAxes,
-                            fontsize=11, color="#000000",
-                            va="top", ha="left",
-                            usetex=False)
-                    rendered = True
-                except Exception as me:
-                    print(f"[render] mathtext failed for '{safe[:60]}': {me}")
-
-                if not rendered:
-                    # Plain monospace fallback
-                    ax.text(0.20, y, expr_latex,
-                            transform=ax.transAxes,
-                            fontsize=9, color="#000000",
-                            va="top", ha="left",
-                            fontfamily="monospace", usetex=False)
-
-            y -= step_gap
-
-        fig.tight_layout(pad=0.4)
+        fig.tight_layout(pad=0.3)
         path = os.path.join(PLOT_FOLDER, f"math_{msg_id}.png")
-        fig.savefig(path, dpi=170, bbox_inches="tight",
+        fig.savefig(path, dpi=180, bbox_inches="tight",
                     facecolor="white", edgecolor="none")
         plt.close("all")
-        print(f"[render] PNG saved → {path}")
+        print(f"[render] PNG saved → {path}  ({n} rows)")
         return path
     except Exception as e:
         print(f"[_render_math_png] FAILED: {e}")
+        import traceback; traceback.print_exc()
         plt.close("all")
         return None
 
@@ -362,33 +375,22 @@ def _build_fourier_steps(expr_str: str) -> tuple[list[tuple[str, str]], str]:
         f      = parse_ct_expr(expr_str)
         f_tex  = _sympy_to_latex(f)
         steps.append(("Input",      rf"f(t) = {f_tex}"))
-        steps.append(("Definition", r"F(\omega)=\int_{-\infty}^{\infty}f(t)\,e^{-j\omega t}\,dt"))
+        steps.append(("Definition", r"F(\omega) = \int_{-\infty}^{\infty} f(t)\, e^{-j\omega t}\, dt"))
 
         rule = _identify_fourier_rule_latex(f)
-        steps.append(("Rule / Form", rule))
-
-        args = sp.Add.make_args(f)
-        if len(args) > 1:
-            partial = []
-            for term in args:
-                try:
-                    r = _fourier_direct(term)
-                    partial.append(
-                        rf"\mathcal{{F}}\{{{_sympy_to_latex(term)}\}} = {_sympy_to_latex(r)}"
-                    )
-                except Exception:
-                    pass
-            if partial:
-                steps.append(("Linearity", r"\quad+\quad".join(partial)))
+        steps.append(("Known pair", rule))
 
         result     = _fourier_direct(f)
-        result_tex = _sympy_to_latex(result)
+        # Replace SymPy's imaginary I with j for engineering notation
+        result_tex = _sympy_to_latex(result).replace(r"\mathbf{i}", "j").replace(" i ", " j ").replace("{i}", "{j}")
+        # Fix common SymPy latex issues: I → j
+        result_tex = re.sub(r'(?<![a-zA-Z])i(?![a-zA-Z])', 'j', result_tex)
         steps.append(("Result", rf"F(\omega) = {result_tex}"))
 
         if "Heaviside" in str(f) and "exp" in str(f):
-            steps.append(("Note", r"|\,F(\omega)\,| \text{ is low-pass; decays as } 1/\omega"))
+            steps.append(("Note", r"|F(\omega)| \text{ is low-pass, decays as } 1/\omega"))
         elif "cos" in str(f) or "sin" in str(f):
-            steps.append(("Note", r"\text{Spectrum consists of discrete Dirac lines}"))
+            steps.append(("Note", r"\text{Spectrum = discrete Dirac lines}"))
 
         return steps, ""
     except Exception as e:
