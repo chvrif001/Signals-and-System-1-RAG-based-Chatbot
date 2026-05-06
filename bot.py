@@ -222,20 +222,32 @@ def _sympy_to_latex(expr: sp.Expr) -> str:
 def _render_math_png(title: str, steps: list[tuple[str, str]], msg_id: int) -> str | None:
     """
     Render a list of (label, latex_expr) pairs as a clean PNG using Matplotlib's
-    built-in mathtext renderer (no external LaTeX installation required).
+    built-in mathtext renderer.
 
-    steps example:
-        [
-            ("Input",      r"f(t) = e^{-t} u(t)"),
-            ("Definition", r"F(s) = \int_0^{\infty} f(t)\,e^{-st}\,dt"),
-            ("Result",     r"F(s) = \frac{1}{s+1}"),
-        ]
-    Returns the file path or None on failure.
+    NOTE: Matplotlib mathtext does NOT support all LaTeX commands.
+    Supported: fractions, Greek letters, sub/superscripts, integrals, sum, sqrt.
+    NOT supported: \\mathcal, \\mathbb, \\mathrm (mostly), \\text (partially).
+    We sanitise the LaTeX strings before rendering.
     """
+
+    def _sanitise(s: str) -> str:
+        """Replace unsupported mathtext commands with renderable equivalents."""
+        s = s.replace(r"\mathcal{L}", r"\mathscr{L}")   # fallback glyph
+        s = s.replace(r"\mathcal{F}", r"\mathscr{F}")
+        # mathscr also not in mathtext — use bold italic instead
+        s = re.sub(r'\\mathcal\{([^}]+)\}', r'\mathbf{\1}', s)
+        s = re.sub(r'\\mathscr\{([^}]+)\}', r'\mathbf{\1}', s)
+        s = re.sub(r'\\mathrm\{([^}]+)\}', r'\rm \1', s)
+        # \text{…} → plain text via \rm
+        s = re.sub(r'\\text\{([^}]*)\}', r'\1', s)
+        # \quad → space
+        s = s.replace(r"\quad", r"\ \ ")
+        return s
+
     try:
         n      = len(steps)
-        fig_h  = max(2.0, 0.75 * n + 1.2)
-        fig, ax = plt.subplots(figsize=(11, fig_h), facecolor="white")
+        fig_h  = max(2.2, 0.80 * n + 1.2)
+        fig, ax = plt.subplots(figsize=(12, fig_h), facecolor="white")
         ax.set_facecolor("white")
         ax.axis("off")
 
@@ -246,50 +258,57 @@ def _render_math_png(title: str, steps: list[tuple[str, str]], msg_id: int) -> s
                 ha="center", va="top", color="#1a1a2e")
 
         # ── Horizontal rule under title ───────────────────────────────────────
-        ax.axhline(y=0.94, xmin=0.02, xmax=0.98,
-                   color="#cccccc", linewidth=0.8,
-                   transform=ax.transAxes)
+        line = plt.Line2D([0.02, 0.98], [0.93, 0.93],
+                          transform=ax.transAxes,
+                          color="#cccccc", linewidth=0.8)
+        ax.add_line(line)
 
         # ── Steps ─────────────────────────────────────────────────────────────
-        y         = 0.90
-        step_gap  = 0.88 / max(n, 1)
+        y        = 0.89
+        step_gap = 0.86 / max(n, 1)
         label_col = "#0077b6"
-        expr_col  = "#000000"
 
         for label, expr_latex in steps:
-            # Label (bold, coloured)
-            ax.text(0.03, y, f"{label}:",
+            # Label (bold, coloured) — plain text, no mathtext
+            ax.text(0.02, y, f"{label}:",
                     transform=ax.transAxes,
-                    fontsize=11, fontweight="bold",
-                    color=label_col, va="top", ha="left")
+                    fontsize=10, fontweight="bold",
+                    color=label_col, va="top", ha="left",
+                    usetex=False)
 
-            # Expression — wrap in $…$ for mathtext rendering
             if expr_latex:
-                # Escape any stray percent signs that break mathtext
-                safe = expr_latex.replace("%", r"\%")
+                safe = _sanitise(expr_latex)
+                rendered = False
+                # Try mathtext rendering
                 try:
-                    ax.text(0.22, y, f"${safe}$",
+                    ax.text(0.20, y, f"${safe}$",
                             transform=ax.transAxes,
-                            fontsize=12, color=expr_col,
+                            fontsize=11, color="#000000",
                             va="top", ha="left",
-                            usetex=False)   # use Matplotlib mathtext, not pdflatex
-                except Exception:
-                    # Fallback: plain text if mathtext chokes on unusual symbols
-                    ax.text(0.22, y, expr_latex,
+                            usetex=False)
+                    rendered = True
+                except Exception as me:
+                    print(f"[render] mathtext failed for '{safe[:60]}': {me}")
+
+                if not rendered:
+                    # Plain monospace fallback
+                    ax.text(0.20, y, expr_latex,
                             transform=ax.transAxes,
-                            fontsize=11, color=expr_col,
-                            va="top", ha="left", fontfamily="monospace")
+                            fontsize=9, color="#000000",
+                            va="top", ha="left",
+                            fontfamily="monospace", usetex=False)
 
             y -= step_gap
 
-        fig.tight_layout(pad=0.5)
+        fig.tight_layout(pad=0.4)
         path = os.path.join(PLOT_FOLDER, f"math_{msg_id}.png")
         fig.savefig(path, dpi=170, bbox_inches="tight",
                     facecolor="white", edgecolor="none")
         plt.close("all")
+        print(f"[render] PNG saved → {path}")
         return path
     except Exception as e:
-        print(f"[_render_math_png] {e}")
+        print(f"[_render_math_png] FAILED: {e}")
         plt.close("all")
         return None
 
@@ -305,7 +324,7 @@ def _build_laplace_steps(expr_str: str) -> tuple[list[tuple[str, str]], str]:
         steps.append(("Input",      rf"f(t) = {f_tex}"))
         steps.append(("Definition", r"F(s) = \int_{0}^{\infty} f(t)\,e^{-st}\,dt"))
 
-        rule = _identify_laplace_rule(f)
+        rule = _identify_laplace_rule_latex(f)
         steps.append(("Rule / Form", rule))
 
         args = sp.Add.make_args(f)
@@ -345,7 +364,7 @@ def _build_fourier_steps(expr_str: str) -> tuple[list[tuple[str, str]], str]:
         steps.append(("Input",      rf"f(t) = {f_tex}"))
         steps.append(("Definition", r"F(\omega)=\int_{-\infty}^{\infty}f(t)\,e^{-j\omega t}\,dt"))
 
-        rule = _identify_fourier_rule(f)
+        rule = _identify_fourier_rule_latex(f)
         steps.append(("Rule / Form", rule))
 
         args = sp.Add.make_args(f)
@@ -566,6 +585,27 @@ def generate_plot(question: str, msg_id: int) -> str | None:
 # LAPLACE TRANSFORM
 # ══════════════════════════════════════════════════════════════════════════════
 def _identify_laplace_rule(expr: sp.Expr) -> str:
+    """Plain-text rule description (used in text fallback only)."""
+    s = str(expr)
+    if "DiracDelta" in s:
+        return "Unit impulse:   L{δ(t)} = 1"
+    if "Heaviside" in s and "exp" not in s and "sin" not in s and "cos" not in s:
+        return "Unit step:      L{u(t)} = 1/s"
+    if "exp" in s and "sin" not in s and "cos" not in s:
+        return "Damped exponential: L{e^{-at}f(t)} = F(s+a)"
+    if "sin" in s:
+        return "Sine:           L{sin(ωt)u(t)} = ω/(s²+ω²)"
+    if "cos" in s:
+        return "Cosine:         L{cos(ωt)u(t)} = s/(s²+ω²)"
+    if str(expr) == str(t_sym):
+        return "Ramp:           L{t·u(t)} = 1/s²"
+    if expr == sp.Integer(1):
+        return "Impulse (constant 1): L{δ(t)} = 1"
+    return "General transform pair / integration by parts"
+
+
+def _identify_laplace_rule_latex(expr: sp.Expr) -> str:
+    """LaTeX rule string (used in PNG renderer)."""
     s = str(expr)
     if "DiracDelta" in s:
         return r"\mathcal{L}\{\delta(t)\} = 1"
@@ -581,7 +621,7 @@ def _identify_laplace_rule(expr: sp.Expr) -> str:
         return r"\mathcal{L}\{t\,u(t)\} = \frac{1}{s^2}"
     if expr == sp.Integer(1):
         return r"\mathcal{L}\{\delta(t)\} = 1"
-    return r"\text{General transform pair / integration by parts}"
+    return r"\text{General transform pair}"
 
 
 def compute_laplace(expr_str: str) -> str:
@@ -627,6 +667,25 @@ def compute_laplace(expr_str: str) -> str:
 # FOURIER TRANSFORM
 # ══════════════════════════════════════════════════════════════════════════════
 def _identify_fourier_rule(expr: sp.Expr) -> str:
+    """Plain-text rule description (used in text fallback only)."""
+    s = str(expr)
+    if "DiracDelta" in s:
+        return "Impulse:   F{δ(t)} = 1"
+    if "Heaviside" in s and "exp" not in s:
+        return "Step:      F{u(t)} = πδ(ω) + 1/jω"
+    if "exp" in s and "sin" not in s and "cos" not in s:
+        return "Damped exp: F{e^{-at}u(t)} = 1/(a+jω)  [a>0]"
+    if "sin" in s:
+        return "Sine:      F{sin(ω₀t)} = jπ[δ(ω+ω₀)−δ(ω−ω₀)]"
+    if "cos" in s:
+        return "Cosine:    F{cos(ω₀t)} = π[δ(ω+ω₀)+δ(ω−ω₀)]"
+    if expr == sp.Integer(1):
+        return "Constant 1: F{1} = 2πδ(ω)"
+    return "General definition: F(ω) = ∫₋∞^∞ f(t)e^{-jωt} dt"
+
+
+def _identify_fourier_rule_latex(expr: sp.Expr) -> str:
+    """LaTeX rule string (used in PNG renderer)."""
     s = str(expr)
     if "DiracDelta" in s:
         return r"\mathcal{F}\{\delta(t)\} = 1"
@@ -640,7 +699,7 @@ def _identify_fourier_rule(expr: sp.Expr) -> str:
         return r"\mathcal{F}\{\cos(\omega_0 t)\} = \pi[\delta(\omega+\omega_0)+\delta(\omega-\omega_0)]"
     if expr == sp.Integer(1):
         return r"\mathcal{F}\{1\} = 2\pi\delta(\omega)"
-    return r"\text{General definition: direct integration}"
+    return r"F(\omega) = \int_{-\infty}^{\infty} f(t)\,e^{-j\omega t}\,dt"
 
 
 def _fourier_direct(f: sp.Expr) -> sp.Expr:
