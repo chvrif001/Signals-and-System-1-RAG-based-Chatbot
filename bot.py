@@ -461,11 +461,39 @@ def _build_fourier_series_steps(expr_str: str, period: float,
         return [], f"❌ Could not compute Fourier series: {e}"
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# CONVOLUTION — FIXED
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _simplify_heaviside_powers(expr: sp.Expr) -> sp.Expr:
+    """
+    Collapse Heaviside(x)**n  →  Heaviside(x) for any integer n >= 1.
+    SymPy does not do this automatically, so unsimplified results like
+    (t-5)*Heaviside(t-5)**2 must be cleaned up here.
+    """
+    return expr.replace(
+        lambda e: e.is_Pow and isinstance(e.base, sp.Heaviside) and e.exp.is_positive,
+        lambda e: e.base
+    )
+
+
 def _build_convolution_steps(expr1_str: str, expr2_str: str,
                               msg_id: int) -> tuple[list[tuple[str, str]], str, str | None]:
-    """Returns (steps, error_string, plot_path)."""
+    """
+    Returns (steps, error_string, plot_path).
+
+    FIX: Always integrate over (-∞, ∞) and let SymPy resolve the Heaviside
+    functions inside the integrand.  This correctly handles delayed signals
+    such as u(t-5) where the old 'both_causal' heuristic wrongly set limits
+    to (0, t) regardless of the delay, producing an answer with a spurious
+    Heaviside² factor.
+
+    After integration we also call _simplify_heaviside_powers() to collapse
+    any residual Heaviside(x)**n → Heaviside(x).
+    """
     steps: list[tuple[str, str]] = []
     plot_path = None
+
     try:
         f = parse_ct_expr(expr1_str)
         g = parse_ct_expr(expr2_str)
@@ -484,17 +512,26 @@ def _build_convolution_steps(expr1_str: str, expr2_str: str,
                    rf"f(\tau)={_sympy_to_latex(f_tau)},\quad g(t-\tau)={_sympy_to_latex(g_shift)}"))
     steps.append(("Integrand",   _sympy_to_latex(integrand)))
 
-    both_causal = ("Heaviside" in str(f) or str(f) == str(sp.Heaviside(t_sym))) and \
-                  ("Heaviside" in str(g) or str(g) == str(sp.Heaviside(t_sym)))
-    limits = (tau, 0, t_sym) if both_causal else (tau, -sp.oo, sp.oo)
+    # ── FIX: always use full limits (-∞, ∞) ──────────────────────────────────
+    # The old heuristic guessed (0, t) whenever both expressions contained
+    # "Heaviside", but this is wrong for delayed signals (e.g. u(t-5)).
+    # SymPy correctly handles the Heaviside step functions inside the integrand
+    # when the limits span the full real line.
+    limits = (tau, -sp.oo, sp.oo)
 
     try:
         result = sp.integrate(integrand, limits)
         result = sp.simplify(result)
+
+        # Collapse Heaviside(x)**n → Heaviside(x) (SymPy doesn't do this automatically)
+        result = _simplify_heaviside_powers(result)
+
         if result.has(sp.Integral):
             raise ValueError("unevaluated integral")
+
         steps.append(("Result", rf"(f\star g)(t) = {_sympy_to_latex(result)}"))
         plot_path = _numerical_convolution_plot(f, g, msg_id)
+
     except Exception as e:
         steps.append(("Note", rf"\text{{Symbolic integration failed: {str(e)[:60]}}}"))
         steps.append(("Fallback", r"\text{See numerical plot}"))
@@ -885,7 +922,7 @@ def compute_fourier_series(expr_str: str, period: float, n_terms: int = 5) -> st
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CONVOLUTION
+# CONVOLUTION — plain-text fallback (also fixed)
 # ══════════════════════════════════════════════════════════════════════════════
 def _parse_two_signals(text: str):
     m = re.split(r'\bwith\b|\band\b|\*|\bstar\b', text, maxsplit=1,
@@ -932,7 +969,11 @@ def _numerical_convolution_plot(f_expr: sp.Expr, g_expr: sp.Expr,
 
 
 def compute_convolution(expr1_str: str, expr2_str: str, msg_id: int = 0):
-    """Kept as plain-text fallback."""
+    """
+    Plain-text fallback for convolution.
+    FIX: Uses full (-∞, ∞) limits and collapses Heaviside powers,
+    matching the fix applied in _build_convolution_steps.
+    """
     lines = ["━━━ 🔁 CONVOLUTION ━━━\n"]
     lines.append(f"f(t) = {expr1_str}")
     lines.append(f"g(t) = {expr2_str}\n")
@@ -949,15 +990,18 @@ def compute_convolution(expr1_str: str, expr2_str: str, msg_id: int = 0):
     lines.append(f"   f(τ)      = {sp.pretty(f_tau)}")
     lines.append(f"   g(t−τ)    = {sp.pretty(g_shift)}")
     lines.append(f"   Integrand = {sp.pretty(integrand)}\n")
-    lines.append("Step 2 — Determine integration limits from signal support:")
-    lines.append("   (Causal signals: limits become 0 to t)\n")
-    plot_path   = None
-    both_causal = ("Heaviside" in str(f) or str(f) == str(sp.Heaviside(t_sym))) and \
-                  ("Heaviside" in str(g) or str(g) == str(sp.Heaviside(t_sym)))
-    limits = (tau, 0, t_sym) if both_causal else (tau, -sp.oo, sp.oo)
+    lines.append("Step 2 — Integrate over the full real line;")
+    lines.append("   SymPy resolves the Heaviside functions to find the true support.\n")
+
+    # FIX: always use full limits
+    limits = (tau, -sp.oo, sp.oo)
+    plot_path = None
+
     try:
         result = sp.integrate(integrand, limits)
         result = sp.simplify(result)
+        # Collapse Heaviside(x)**n → Heaviside(x)
+        result = _simplify_heaviside_powers(result)
         if result.has(sp.Integral):
             raise ValueError("SymPy returned unevaluated integral")
         lines.append("Step 3 — Evaluate the integral:")
