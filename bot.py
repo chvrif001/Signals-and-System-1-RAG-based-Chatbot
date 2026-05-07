@@ -259,6 +259,24 @@ def _sanitise_mathtext(s: str) -> str:
     return s
 
 
+def _row_height_in(latex_str: str, base: float = 0.75) -> float:
+    """
+    Estimate the height (inches) needed for one row based on its content.
+    Rows with tall math need more space than simple expressions.
+    """
+    if not latex_str:
+        return base
+    # Integrals and long linearity rows need extra room
+    if r'\int' in latex_str:
+        return base + 0.45
+    # Fractions inside fractions or long linearity lines
+    if latex_str.count(r'\frac') >= 3 or latex_str.count(r'\mathbf') >= 3:
+        return base + 0.55
+    if r'\frac' in latex_str or r'\sum' in latex_str:
+        return base + 0.25
+    return base
+
+
 def _try_render_row(ax, x_label: float, x_expr: float, y: float,
                     label: str, latex_str: str, fontsize: int = 20) -> None:
     """
@@ -290,52 +308,64 @@ def _try_render_row(ax, x_label: float, x_expr: float, y: float,
 def _render_math_png(title: str, steps: list[tuple[str, str]], msg_id: int) -> str | None:
     """
     Render a list of (label, latex_expr) pairs as a clean PNG.
-    Width is fixed; height grows with the number of rows so text is never tiny.
+    Height is computed dynamically per row so tall math never overlaps.
     """
     try:
-        n       = len(steps)
-        FONT    = 20          # base font size (pt) — large and readable on mobile
-        ROW_IN  = 0.65        # inches per row
-        PAD_IN  = 1.4         # inches for title + padding
-        fig_h   = max(3.0, n * ROW_IN + PAD_IN)
-        fig_w   = 9.0         # narrower → larger effective text on screen
+        FONT   = 20
+        FIG_W  = 9.0
+        PAD_IN = 1.3       # title + top/bottom padding
 
-        fig, ax = plt.subplots(figsize=(fig_w, fig_h), facecolor="white")
+        # Compute per-row heights then total figure height
+        row_heights = [_row_height_in(latex_str) for _, latex_str in steps]
+        total_rows_h = sum(row_heights)
+        fig_h = max(3.0, total_rows_h + PAD_IN)
+
+        # Strip emoji from title (not in default font)
+        title_clean = re.sub(r'[^\x00-\x7F]+', '', title).strip()
+
+        fig, ax = plt.subplots(figsize=(FIG_W, fig_h), facecolor="white")
         ax.set_facecolor("white")
         ax.axis("off")
         ax.set_xlim(0, 1)
-        ax.set_ylim(0, 1)
+        ax.set_ylim(0, fig_h)          # use inches as y-axis units for simplicity
 
         # ── Title ──────────────────────────────────────────────────────────
-        # Strip emoji from title (not in DejaVu font)
-        title_clean = re.sub(r'[^\x00-\x7F]+', '', title).strip()
-        ax.text(0.5, 0.97, title_clean,
-                transform=ax.transAxes,
+        ax.text(FIG_W / 2, fig_h - 0.15, title_clean,
                 fontsize=FONT + 3, fontweight="bold",
                 ha="center", va="top", color="#1a1a2e", usetex=False)
 
         # ── Divider ────────────────────────────────────────────────────────
-        divider_y = 1.0 - (PAD_IN * 0.45 / fig_h)
-        ax.plot([0.01, 0.99], [divider_y, divider_y],
-                color="#aaaaaa", linewidth=1.2,
-                transform=ax.transAxes)
+        div_y = fig_h - PAD_IN * 0.55
+        ax.plot([0.08, FIG_W - 0.08], [div_y, div_y],
+                color="#aaaaaa", linewidth=1.2)
 
-        # ── Rows ───────────────────────────────────────────────────────────
-        row_frac = ROW_IN / fig_h          # fraction of figure height per row
-        y = divider_y - (0.15 / fig_h) - row_frac * 0.15
+        # ── Rows — walk down from divider ──────────────────────────────────
+        y = div_y - 0.18
+        for (label, latex_str), rh in zip(steps, row_heights):
+            # Label
+            ax.text(0.10, y, f"{label}:",
+                    fontsize=FONT - 1, fontweight="bold",
+                    color="#0055aa", va="top", ha="left", usetex=False)
+            # Expression
+            if latex_str:
+                safe = _sanitise_mathtext(latex_str)
+                try:
+                    ax.text(2.20, y, f"${safe}$",
+                            fontsize=FONT, color="#111111",
+                            va="top", ha="left", usetex=False)
+                except Exception as e:
+                    print(f"[render fallback] {label}: {e}")
+                    ax.text(2.20, y, latex_str,
+                            fontsize=FONT - 4, color="#333333",
+                            va="top", ha="left", fontfamily="monospace", usetex=False)
+            y -= rh          # step down by this row's actual height
 
-        for label, latex_str in steps:
-            _try_render_row(ax, 0.01, 0.28, y, label, latex_str, fontsize=FONT)
-            y -= row_frac
-            if y < 0.01:
-                break
-
-        fig.tight_layout(pad=0.5)
+        fig.tight_layout(pad=0.4)
         path = os.path.join(PLOT_FOLDER, f"math_{msg_id}.png")
         fig.savefig(path, dpi=180, bbox_inches="tight",
                     facecolor="white", edgecolor="none")
         plt.close("all")
-        print(f"[render] PNG saved → {path}  ({n} rows, {fig_w}×{fig_h:.1f} in)")
+        print(f"[render] PNG saved → {path}  ({len(steps)} rows, {FIG_W}×{fig_h:.2f} in)")
         return path
     except Exception as e:
         print(f"[_render_math_png] FAILED: {e}")
