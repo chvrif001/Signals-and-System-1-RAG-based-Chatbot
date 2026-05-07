@@ -260,20 +260,18 @@ def _sanitise_mathtext(s: str) -> str:
 
 
 def _try_render_row(ax, x_label: float, x_expr: float, y: float,
-                    label: str, latex_str: str, fontsize: int = 13) -> float:
+                    label: str, latex_str: str, fontsize: int = 20) -> None:
     """
     Draw one label + expression row on `ax`.
-    Returns the height consumed (in axes-fraction units).
-    Tries mathtext first; falls back to a pretty-printed monospace string.
+    Tries mathtext first; falls back to monospace plain text.
     """
-    label_col = "#0055aa"
     ax.text(x_label, y, f"{label}:",
             transform=ax.transAxes,
             fontsize=fontsize - 1, fontweight="bold",
-            color=label_col, va="top", ha="left", usetex=False)
+            color="#0055aa", va="top", ha="left", usetex=False)
 
     if not latex_str:
-        return 0.07
+        return
 
     safe = _sanitise_mathtext(latex_str)
     try:
@@ -281,25 +279,26 @@ def _try_render_row(ax, x_label: float, x_expr: float, y: float,
                 transform=ax.transAxes,
                 fontsize=fontsize, color="#111111",
                 va="top", ha="left", usetex=False)
-    except Exception:
-        # Absolute fallback: monospace plain text
+    except Exception as e:
+        print(f"[render row fallback] {label}: {e}")
         ax.text(x_expr, y, latex_str,
                 transform=ax.transAxes,
-                fontsize=fontsize - 2, color="#111111",
+                fontsize=fontsize - 3, color="#333333",
                 va="top", ha="left", fontfamily="monospace", usetex=False)
-    return 0.07
 
 
 def _render_math_png(title: str, steps: list[tuple[str, str]], msg_id: int) -> str | None:
     """
     Render a list of (label, latex_expr) pairs as a clean PNG.
-    Each step gets its own row.  Uses Matplotlib mathtext (no pdflatex needed).
+    Width is fixed; height grows with the number of rows so text is never tiny.
     """
     try:
         n       = len(steps)
-        row_h   = 0.072          # axes-fraction per row
-        fig_h   = max(2.5, n * row_h * 14 + 1.6)   # inches
-        fig_w   = 13.0
+        FONT    = 20          # base font size (pt) — large and readable on mobile
+        ROW_IN  = 0.65        # inches per row
+        PAD_IN  = 1.4         # inches for title + padding
+        fig_h   = max(3.0, n * ROW_IN + PAD_IN)
+        fig_w   = 9.0         # narrower → larger effective text on screen
 
         fig, ax = plt.subplots(figsize=(fig_w, fig_h), facecolor="white")
         ax.set_facecolor("white")
@@ -308,30 +307,35 @@ def _render_math_png(title: str, steps: list[tuple[str, str]], msg_id: int) -> s
         ax.set_ylim(0, 1)
 
         # ── Title ──────────────────────────────────────────────────────────
-        ax.text(0.5, 0.97, title,
+        # Strip emoji from title (not in DejaVu font)
+        title_clean = re.sub(r'[^\x00-\x7F]+', '', title).strip()
+        ax.text(0.5, 0.97, title_clean,
                 transform=ax.transAxes,
-                fontsize=16, fontweight="bold",
+                fontsize=FONT + 3, fontweight="bold",
                 ha="center", va="top", color="#1a1a2e", usetex=False)
 
         # ── Divider ────────────────────────────────────────────────────────
-        ax.plot([0.01, 0.99], [0.92, 0.92],
-                color="#aaaaaa", linewidth=1.0,
+        divider_y = 1.0 - (PAD_IN * 0.45 / fig_h)
+        ax.plot([0.01, 0.99], [divider_y, divider_y],
+                color="#aaaaaa", linewidth=1.2,
                 transform=ax.transAxes)
 
         # ── Rows ───────────────────────────────────────────────────────────
-        y = 0.90
+        row_frac = ROW_IN / fig_h          # fraction of figure height per row
+        y = divider_y - (0.15 / fig_h) - row_frac * 0.15
+
         for label, latex_str in steps:
-            _try_render_row(ax, 0.01, 0.22, y, label, latex_str, fontsize=13)
-            y -= row_h
-            if y < 0.02:          # safety: don't overflow the axes
+            _try_render_row(ax, 0.01, 0.28, y, label, latex_str, fontsize=FONT)
+            y -= row_frac
+            if y < 0.01:
                 break
 
-        fig.tight_layout(pad=0.3)
+        fig.tight_layout(pad=0.5)
         path = os.path.join(PLOT_FOLDER, f"math_{msg_id}.png")
         fig.savefig(path, dpi=180, bbox_inches="tight",
                     facecolor="white", edgecolor="none")
         plt.close("all")
-        print(f"[render] PNG saved → {path}  ({n} rows)")
+        print(f"[render] PNG saved → {path}  ({n} rows, {fig_w}×{fig_h:.1f} in)")
         return path
     except Exception as e:
         print(f"[_render_math_png] FAILED: {e}")
