@@ -462,7 +462,7 @@ def _build_fourier_series_steps(expr_str: str, period: float,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CONVOLUTION — FIXED
+# CONVOLUTION — FIXED (smart limit selector)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _simplify_heaviside_powers(expr: sp.Expr) -> sp.Expr:
@@ -477,19 +477,77 @@ def _simplify_heaviside_powers(expr: sp.Expr) -> sp.Expr:
     )
 
 
+def _extract_heaviside_onset(expr: sp.Expr) -> sp.Expr | None:
+    """
+    Given a SymPy expression, find the onset (lower bound) of the first
+    Heaviside factor.  Returns the delay constant `d` where the signal
+    is nonzero for t >= d, or None if no Heaviside is found.
+
+    Examples:
+      Heaviside(t)      → 0
+      Heaviside(t - 5)  → 5
+      Heaviside(t + 2)  → -2
+    """
+    for arg in sp.preorder_traversal(expr):
+        if isinstance(arg, sp.Heaviside):
+            inner = arg.args[0]   # the argument of Heaviside, e.g. t-5
+            # inner = t - d  →  d = t - inner  evaluated at t=0 gives -inner|_{t=0}
+            # More robustly: solve inner = 0 for t
+            sol = sp.solve(inner, t_sym)
+            if sol:
+                return sol[0]
+            # If it's just `t`, onset is 0
+            if inner == t_sym:
+                return sp.Integer(0)
+    return None
+
+
+def _compute_causal_limits(f: sp.Expr, g: sp.Expr):
+    """
+    Determine the correct symbolic integration limits for the convolution
+    integral  ∫ f(τ) g(t−τ) dτ  when both signals are causal (Heaviside-gated).
+
+    Strategy
+    --------
+    After substituting τ into f and (t−τ) into g:
+      • f(τ)    is nonzero for τ ≥ d_f   (d_f = onset of f)
+      • g(t−τ)  is nonzero for t−τ ≥ d_g, i.e. τ ≤ t − d_g
+
+    So the correct limits are  (d_f,  t − d_g).
+
+    Returns (lower, upper) as SymPy expressions, or None to signal that
+    full limits (-∞, ∞) should be used instead.
+    """
+    d_f = _extract_heaviside_onset(f)
+    d_g = _extract_heaviside_onset(g)
+
+    if d_f is None or d_g is None:
+        return None   # at least one signal has no Heaviside — use full limits
+
+    lower = d_f
+    upper = t_sym - d_g
+    return lower, upper
+
+
 def _build_convolution_steps(expr1_str: str, expr2_str: str,
                               msg_id: int) -> tuple[list[tuple[str, str]], str, str | None]:
     """
     Returns (steps, error_string, plot_path).
 
-    FIX: Always integrate over (-∞, ∞) and let SymPy resolve the Heaviside
-    functions inside the integrand.  This correctly handles delayed signals
-    such as u(t-5) where the old 'both_causal' heuristic wrongly set limits
-    to (0, t) regardless of the delay, producing an answer with a spurious
-    Heaviside² factor.
+    STRATEGY
+    --------
+    1. If both signals are Heaviside-gated, extract each signal's onset delay
+       analytically and set exact limits (d_f, t − d_g).  This handles both
+       the plain  u(t) ★ u(t)  case  (limits 0 → t, result = t·u(t))  and the
+       delayed  u(t) ★ u(t−5)  case  (limits 0 → t−5, result = (t−5)·u(t−5))
+       without ever leaving a Heaviside² in the result.
 
-    After integration we also call _simplify_heaviside_powers() to collapse
-    any residual Heaviside(x)**n → Heaviside(x).
+    2. If either signal has no Heaviside (e.g. a decaying exponential without
+       an explicit step), fall back to full limits (-∞, ∞) and let SymPy
+       handle the Heaviside internally.
+
+    3. After integration, call _simplify_heaviside_powers() to collapse any
+       residual Heaviside(x)**n → Heaviside(x).
     """
     steps: list[tuple[str, str]] = []
     plot_path = None
@@ -512,12 +570,20 @@ def _build_convolution_steps(expr1_str: str, expr2_str: str,
                    rf"f(\tau)={_sympy_to_latex(f_tau)},\quad g(t-\tau)={_sympy_to_latex(g_shift)}"))
     steps.append(("Integrand",   _sympy_to_latex(integrand)))
 
-    # ── FIX: always use full limits (-∞, ∞) ──────────────────────────────────
-    # The old heuristic guessed (0, t) whenever both expressions contained
-    # "Heaviside", but this is wrong for delayed signals (e.g. u(t-5)).
-    # SymPy correctly handles the Heaviside step functions inside the integrand
-    # when the limits span the full real line.
-    limits = (tau, -sp.oo, sp.oo)
+    # ── Choose integration limits analytically ────────────────────────────────
+    causal_limits = _compute_causal_limits(f, g)
+
+    if causal_limits is not None:
+        lower, upper = causal_limits
+        limits = (tau, lower, upper)
+        lower_tex = _sympy_to_latex(lower)
+        upper_tex = _sympy_to_latex(upper)
+        steps.append(("Limits",
+                       rf"\tau \in [{lower_tex},\; {upper_tex}] "
+                       rf"\text{{ (from Heaviside support)}}"))
+    else:
+        limits = (tau, -sp.oo, sp.oo)
+        steps.append(("Limits", r"\tau \in (-\infty, \infty)"))
 
     try:
         result = sp.integrate(integrand, limits)
@@ -971,8 +1037,7 @@ def _numerical_convolution_plot(f_expr: sp.Expr, g_expr: sp.Expr,
 def compute_convolution(expr1_str: str, expr2_str: str, msg_id: int = 0):
     """
     Plain-text fallback for convolution.
-    FIX: Uses full (-∞, ∞) limits and collapses Heaviside powers,
-    matching the fix applied in _build_convolution_steps.
+    Uses the same smart limit selector as _build_convolution_steps.
     """
     lines = ["━━━ 🔁 CONVOLUTION ━━━\n"]
     lines.append(f"f(t) = {expr1_str}")
@@ -990,11 +1055,16 @@ def compute_convolution(expr1_str: str, expr2_str: str, msg_id: int = 0):
     lines.append(f"   f(τ)      = {sp.pretty(f_tau)}")
     lines.append(f"   g(t−τ)    = {sp.pretty(g_shift)}")
     lines.append(f"   Integrand = {sp.pretty(integrand)}\n")
-    lines.append("Step 2 — Integrate over the full real line;")
-    lines.append("   SymPy resolves the Heaviside functions to find the true support.\n")
 
-    # FIX: always use full limits
-    limits = (tau, -sp.oo, sp.oo)
+    causal_limits = _compute_causal_limits(f, g)
+    if causal_limits is not None:
+        lower, upper = causal_limits
+        limits = (tau, lower, upper)
+        lines.append(f"Step 2 — Integration limits from Heaviside support: τ ∈ [{lower}, {upper}]\n")
+    else:
+        limits = (tau, -sp.oo, sp.oo)
+        lines.append("Step 2 — Integrate over the full real line (-∞, ∞).\n")
+
     plot_path = None
 
     try:
