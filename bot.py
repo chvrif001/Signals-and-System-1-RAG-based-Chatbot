@@ -726,7 +726,13 @@ def _fourier_direct(f: sp.Expr) -> sp.Expr:
     """
     Compute F(ω) = ∫_{-∞}^{∞} f(t) e^{-jωt} dt symbolically.
     Falls back to a table of known pairs for non-L¹-integrable signals.
+
+    FIX (line 784-785 area): the Heaviside branch now extracts any scalar
+    coefficient from f before looking up the table pair, then scales the
+    result.  Previously 2*u(t) returned πδ(ω)+1/(jω) instead of
+    2πδ(ω)+2/(jω).
     """
+    # ── 1. Try direct symbolic integration first ───────────────────────────
     try:
         result = sp.integrate(
             f * sp.exp(-sp.I * w_sym * t_sym),
@@ -739,21 +745,42 @@ def _fourier_direct(f: sp.Expr) -> sp.Expr:
 
     s = str(f)
 
+    # ── 2. cos(ω₀t) ───────────────────────────────────────────────────────
     if "cos" in s:
         m = re.search(r'cos\(\s*([^)]+?)\s*\*?\s*t\b', str(f))
         if m:
             w0 = sp.sympify(m.group(1).strip(), locals=_COMMON_NS)
             return sp.pi * (sp.DiracDelta(w_sym - w0) + sp.DiracDelta(w_sym + w0))
 
+    # ── 3. sin(ω₀t) ───────────────────────────────────────────────────────
     if "sin" in s:
         m = re.search(r'sin\(\s*([^)]+?)\s*\*?\s*t\b', str(f))
         if m:
             w0 = sp.sympify(m.group(1).strip(), locals=_COMMON_NS)
             return sp.I * sp.pi * (sp.DiracDelta(w_sym + w0) - sp.DiracDelta(w_sym - w0))
 
+    # ── 4. Scaled u(t)  —  THE FIX ────────────────────────────────────────
+    # For expressions like 2*u(t), 0.5*u(t), a*u(t) we must extract the
+    # scalar multiplier BEFORE returning the table pair.  Without this step
+    # the multiplier is silently dropped and the result is always the pair
+    # for plain u(t), i.e. πδ(ω) + 1/(jω).
     if "Heaviside" in s and "exp" not in s:
-        return sp.pi * sp.DiracDelta(w_sym) + 1 / (sp.I * w_sym)
+        coeff = sp.Integer(1)
+        if f.is_Mul:
+            numeric_factors = []
+            other_factors   = []
+            for arg in f.args:
+                if arg.is_number:
+                    numeric_factors.append(arg)
+                else:
+                    other_factors.append(arg)
+            if numeric_factors:
+                coeff = sp.Mul(*numeric_factors)
+        # Table pair for u(t):  πδ(ω) + 1/(jω)
+        pair = sp.pi * sp.DiracDelta(w_sym) + 1 / (sp.I * w_sym)
+        return sp.simplify(coeff * pair)
 
+    # ── 5. Constant 1  ────────────────────────────────────────────────────
     if f == sp.Integer(1):
         return 2 * sp.pi * sp.DiracDelta(w_sym)
 
