@@ -295,10 +295,10 @@ def _render_math_png(title: str, steps: list[tuple[str, str]], msg_id: int) -> s
     try:
         n       = len(steps)
         FONT    = 20          # base font size (pt) — large and readable on mobile
-        ROW_IN  = 1.50        # inches per row
+        ROW_IN  = 0.80        # inches per row
         PAD_IN  = 1.4         # inches for title + padding
         fig_h   = max(3.0, n * ROW_IN + PAD_IN)
-        fig_w   = 9.0         # narrower → larger effective text on screen
+        fig_w   = 12.0         # narrower → larger effective text on screen
 
         fig, ax = plt.subplots(figsize=(fig_w, fig_h), facecolor="white")
         ax.set_facecolor("white")
