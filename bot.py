@@ -223,25 +223,39 @@ def _sympy_to_latex(expr: sp.Expr) -> str:
 def _sanitise_mathtext(s: str) -> str:
     """
     Convert full LaTeX to the subset supported by Matplotlib mathtext.
-    Key restrictions: no \\mathcal, no \\operatorname, no \\text with spaces,
-    no \\left/\\right (optional but sometimes breaks), no \\,
+    Key restrictions: no \\mathcal, no \\operatorname, no \\text with spaces.
+    Also fixes SymPy-specific output quirks before rendering.
+    All regex patterns use raw strings to avoid Python escape issues.
     """
-    # \mathcal{X} → script-like bold
-    s = re.sub(r'\\mathcal\{([^}]+)\}', r'\\mathbf{\1}', s)
-    # \mathrm{…} → roman (supported in mathtext)
-    s = re.sub(r'\\mathrm\{([^}]+)\}', r'\\rm \1', s)
-    # \operatorname{…} → plain
-    s = re.sub(r'\\operatorname\{([^}]+)\}', r'\\mathrm{\1}', s)
-    # \text{…} → strip braces, keep content
-    s = re.sub(r'\\text\{([^}]*)\}', r'\\mathrm{\1}', s)
-    # \quad / \qquad → spaces
+    # ── SymPy quirks ──────────────────────────────────────────────────────────
+    # SymPy renders Heaviside(t) as \theta\left(t\right) — fix to u(t)
+    s = re.sub(r'\\theta\\left\(([^)]+)\\right\)', r'u(\1)', s)
+    s = s.replace(r'\theta\left(t\right)', r'u(t)')
+    # SymPy uses imaginary 'i' — replace with engineering 'j'
+    # Only standalone i (not inside variable names like 'pi', 'sin', etc.)
+    s = re.sub(r'(?<![a-zA-Z\\])i(?![a-zA-Z0-9{])', r'j', s)
+
+    # ── Unsupported font commands ──────────────────────────────────────────────
+    # \mathcal{X} and \mathscr{X} → bold (mathtext has no calligraphic font)
+    s = re.sub(r'\\mathcal\{([^}]+)\}',  r'\\mathbf{\1}', s)
+    s = re.sub(r'\\mathscr\{([^}]+)\}',  r'\\mathbf{\1}', s)
+    # \mathrm{…} → supported as \rm in mathtext
+    s = re.sub(r'\\mathrm\{([^}]+)\}',   r'\\rm \1',      s)
+    # \operatorname{…} → treat same as \mathrm
+    s = re.sub(r'\\operatorname\{([^}]+)\}', r'\\rm \1',  s)
+    # \text{…} → plain upright text
+    s = re.sub(r'\\text\{([^}]*)\}',     r'\\rm \1',      s)
+
+    # ── Spacing ───────────────────────────────────────────────────────────────
     s = s.replace(r'\qquad', r'\ \ \ \ ')
     s = s.replace(r'\quad',  r'\ \ ')
-    # thin space \, → single space
-    s = s.replace(r'\,', r'\ ')
-    # \left and \right are optional decorators — remove them (keep the bracket)
+    s = s.replace(r'\,',     r'\ ')
+    s = s.replace(r'\;',     r'\ ')
+
+    # ── \left / \right — optional size hints, strip them (keep the bracket) ──
     s = re.sub(r'\\left\s*',  '', s)
     s = re.sub(r'\\right\s*', '', s)
+
     return s
 
 
@@ -300,9 +314,9 @@ def _render_math_png(title: str, steps: list[tuple[str, str]], msg_id: int) -> s
                 ha="center", va="top", color="#1a1a2e", usetex=False)
 
         # ── Divider ────────────────────────────────────────────────────────
-        ax.axhline(y=0.92, xmin=0.01, xmax=0.99,
-                   color="#aaaaaa", linewidth=1.0,
-                   transform=ax.transAxes)
+        ax.plot([0.01, 0.99], [0.92, 0.92],
+                color="#aaaaaa", linewidth=1.0,
+                transform=ax.transAxes)
 
         # ── Rows ───────────────────────────────────────────────────────────
         y = 0.90
