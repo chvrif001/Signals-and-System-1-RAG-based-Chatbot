@@ -202,7 +202,7 @@ def extract_expr(question: str) -> str | None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LATEX / MATHTEXT SANITISER  (shared by math PNGs and response renderer)
+# LATEX / MATHTEXT SANITISER
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _sanitise_mathtext(s: str) -> str:
@@ -224,7 +224,7 @@ def _sanitise_mathtext(s: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LATEX MATH RENDERER  (used by transform / convolution step cards)
+# LATEX MATH RENDERER
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _sympy_to_latex(expr: sp.Expr) -> str:
@@ -302,7 +302,7 @@ def _render_math_png(title: str, steps: list[tuple[str, str]], msg_id: int) -> s
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LLM RESPONSE RENDERER  (prose + inline math → PNG)
+# LLM RESPONSE RENDERER
 # ══════════════════════════════════════════════════════════════════════════════
 
 _PLAIN_TO_MATHTEXT = [
@@ -338,7 +338,6 @@ def _plain_to_mt(expr: str) -> str:
 
 
 def _extract_math_blocks(text: str) -> list[tuple[str, str]]:
-    """Split text on $...$ / $$...$$ delimiters."""
     segments = []
     parts = re.split(r'(\$\$[\s\S]+?\$\$|\$[^$\n]+?\$)', text)
     for part in parts:
@@ -352,7 +351,6 @@ def _extract_math_blocks(text: str) -> list[tuple[str, str]]:
 
 
 def _split_prose_lines(prose: str) -> list[tuple[str, str]]:
-    """Tag equation-looking lines inside a prose block as 'math'."""
     out = []
     for line in prose.split('\n'):
         stripped = line.strip()
@@ -364,12 +362,6 @@ def _split_prose_lines(prose: str) -> list[tuple[str, str]]:
 
 
 def render_response_png(llm_text: str, title: str, msg_id: int) -> str | None:
-    """
-    Render a full LLM text response as a PNG image.
-    $...$ / $$...$$ blocks → blue mathtext.
-    Equation-looking plain lines → promoted to mathtext automatically.
-    Prose lines rendered as clean text with bold step headings.
-    """
     rows: list[tuple[str, str]] = []
     for kind, content in _extract_math_blocks(llm_text):
         if kind == 'math':
@@ -377,7 +369,6 @@ def render_response_png(llm_text: str, title: str, msg_id: int) -> str | None:
         else:
             rows.extend(_split_prose_lines(content))
 
-    # Trim blank edges
     while rows and rows[0][1].strip() == '':
         rows.pop(0)
     while rows and rows[-1][1].strip() == '':
@@ -389,8 +380,8 @@ def render_response_png(llm_text: str, title: str, msg_id: int) -> str | None:
     FIG_W     = 13.0
     PROSE_FS  = 13
     MATH_FS   = 15
-    LINE_H    = 0.38   # inches per prose line
-    MATH_H    = 0.55   # inches per math line
+    LINE_H    = 0.38
+    MATH_H    = 0.55
     TITLE_H   = 0.65
     PAD       = 0.4
 
@@ -405,7 +396,6 @@ def render_response_png(llm_text: str, title: str, msg_id: int) -> str | None:
     ax.set_xlim(0, 1)
     ax.set_ylim(0, total_h)
 
-    # Title
     y = total_h - 0.15
     ax.text(0.5, y, title,
             fontsize=16, fontweight='bold', color='#1a1a2e',
@@ -434,7 +424,6 @@ def render_response_png(llm_text: str, title: str, msg_id: int) -> str | None:
                         va='top', ha='left', fontfamily='monospace', usetex=False)
             y -= MATH_H
         else:
-            # Strip markdown bold/italic markers
             display = re.sub(r'\*\*?([^*]+)\*\*?', r'\1', txt)
             display = re.sub(r'__?([^_]+)__?',      r'\1', display)
             is_heading = bool(re.match(r'\*\*', txt) or re.match(r'Step\s+\d+', txt.strip()))
@@ -455,10 +444,6 @@ def render_response_png(llm_text: str, title: str, msg_id: int) -> str | None:
 
 async def send_llm_response(update: Update, response_text: str,
                              title: str, msg_id: int) -> None:
-    """
-    Send an LLM response as a rendered PNG.
-    Falls back to chunked plain text if rendering fails.
-    """
     png = render_response_png(response_text, title, msg_id)
     if png and os.path.exists(png):
         await update.message.reply_photo(
@@ -635,7 +620,7 @@ def _build_fourier_series_steps(expr_str: str, period: float,
                        r"b_n=\frac{2}{T}\int_0^T f(t)\sin(n\omega_0 t)\,dt"))
 
         a0     = sp.simplify(sp.integrate(f, (t_sym, 0, T)) / T)
-        steps.append(("a₀ (DC)", rf"a_0 = {_sympy_to_latex(a0)}"))
+        steps.append(("a0 (DC)", rf"a_0 = {_sympy_to_latex(a0)}"))
 
         for k in range(1, n_terms + 1):
             try:
@@ -1593,23 +1578,27 @@ def auto_route_extracted_text(extracted: str) -> str | None:
 # SESSION-AWARE LLM PROMPTS
 # ══════════════════════════════════════════════════════════════════════════════
 
+# FIX: All curly braces that are NOT template variables must be doubled so
+# that PromptTemplate.from_template() does not mistake them for variables.
 _LATEX_INSTRUCTION = (
     "FORMATTING RULE: Wrap ALL mathematical expressions, equations, and formulas "
     "using LaTeX notation: $...$ for inline math and $$...$$ for display/standalone equations. "
-    "For example, write $G(\\omega) = \\frac{1}{a + j\\omega}$ not G(omega) = 1/(a+jw). "
-    "Use standard LaTeX commands: \\frac{}{}, \\int, \\sum, \\omega, \\delta, \\pi, "
-    "\\mathcal{L}, \\mathcal{F}, e^{-st}, etc."
+    "For example, write $G(\\omega) = \\frac{{1}}{{a + j\\omega}}$ not G(omega) = 1/(a+jw). "
+    "Use standard LaTeX commands: \\frac{{}}{{}}, \\int, \\sum, \\omega, \\delta, \\pi, "
+    "\\mathcal{{L}}, \\mathcal{{F}}, e^{{-st}}, etc."
 )
 
-_SESSION_RULES = f"""IMPORTANT — follow strictly:
-1. The uploaded document is the PRIMARY and authoritative source of truth.
-2. Use your general Signals & Systems knowledge ONLY to explain or clarify —
-   never to contradict, override, or replace the uploaded content.
-3. For correctness, marking, and solution verification rely exclusively on
-   the uploaded document.
-4. If OCR output looks garbled in a critical spot, say so and give your best
-   interpretation — do not silently substitute your own answer.
-5. {_LATEX_INSTRUCTION}"""
+_SESSION_RULES = (
+    "IMPORTANT — follow strictly:\n"
+    "1. The uploaded document is the PRIMARY and authoritative source of truth.\n"
+    "2. Use your general Signals & Systems knowledge ONLY to explain or clarify —\n"
+    "   never to contradict, override, or replace the uploaded content.\n"
+    "3. For correctness, marking, and solution verification rely exclusively on\n"
+    "   the uploaded document.\n"
+    "4. If OCR output looks garbled in a critical spot, say so and give your best\n"
+    "   interpretation — do not silently substitute your own answer.\n"
+    f"5. {_LATEX_INSTRUCTION}"
+)
 
 
 def _prompt_explain_memo(doc_text: str, instruction: str) -> str:
@@ -1674,7 +1663,7 @@ def _prompt_explain(doc_text: str, question: str) -> str:
         f"Uploaded document:\n\"\"\"\n{doc_text}\n\"\"\"\n\n"
         f"Student question: {question}\n\n"
         f"Classify your answer silently:\n"
-        f"  FACTUAL     → 2–4 sentences.\n"
+        f"  FACTUAL     → 2-4 sentences.\n"
         f"  CONCEPTUAL  → short paragraph + one example.\n"
         f"  CALCULATION → numbered steps, explain every symbol.\n"
         f"Answer based on the uploaded document. Use general knowledge only to aid clarity. "
@@ -1770,18 +1759,26 @@ def build_vector_store_if_needed(pdf_folder: str, chroma_dir: str):
 # ══════════════════════════════════════════════════════════════════════════════
 # RAG CHAINS
 # ══════════════════════════════════════════════════════════════════════════════
+
+# FIX: All literal curly braces inside the PromptTemplate string that are NOT
+# {context} or {question} placeholders must be doubled: { → {{ and } → }}
+# This prevents LangChain from treating them as variable names.
 TUTOR_PROMPT = PromptTemplate.from_template(
     "You are a Signals and Systems tutor assistant.\n\n"
-    f"{_LATEX_INSTRUCTION}\n\n"
+    "FORMATTING RULE: Wrap ALL mathematical expressions, equations, and formulas "
+    "using LaTeX notation: $...$ for inline math and $$...$$ for display equations. "
+    "For example, write $G(\\omega) = \\frac{{1}}{{a + j\\omega}}$ not G(omega) = 1/(a+jw). "
+    "Use standard LaTeX commands: \\frac{{}}{{}}, \\int, \\sum, \\omega, \\delta, \\pi, "
+    "\\mathcal{{L}}, \\mathcal{{F}}, e^{{-st}}, etc.\n\n"
     "First, silently classify the student's question into one of three types:\n"
     "  A) FACTUAL — asking for course info, dates, definitions, or simple facts\n"
     "  B) CONCEPTUAL — asking to understand an idea, theorem, or technique\n"
     "  C) CALCULATION — asking to solve or explain a problem or work through math\n\n"
     "Then respond according to the type:\n"
-    "  A) FACTUAL → Answer in 2-4 sentences. No steps, no examples.\n"
-    "  B) CONCEPTUAL → Explain clearly in a short paragraph of 4-6 sentences. "
+    "  A) FACTUAL -> Answer in 2-4 sentences. No steps, no examples.\n"
+    "  B) CONCEPTUAL -> Explain clearly in a short paragraph of 4-6 sentences. "
     "Give exactly one simple example. No numbered steps.\n"
-    "  C) CALCULATION → Work through or explain it step by step with numbered steps. "
+    "  C) CALCULATION -> Work through or explain it step by step with numbered steps. "
     "Explain every formula and symbol used.\n\n"
     "Do not mention the classification in your response. Just answer.\n"
     "If the answer is not in the context, say so honestly.\n\n"
@@ -1873,35 +1870,34 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🆘 *Full guide:*\n\n"
-        "1️⃣ *Laplace Transform*\n"
+        "1. *Laplace Transform*\n"
         "   _laplace of e^(-2*t)*u(t)_\n\n"
-        "2️⃣ *Fourier Transform*\n"
+        "2. *Fourier Transform*\n"
         "   _fourier transform of e^(-t)*u(t)_\n\n"
-        "3️⃣ *Periodic Summation Fourier*\n"
+        "3. *Periodic Summation Fourier*\n"
         "   _fourier transform of x(t)=sum g(t-2k), g(t)=e^(-t)*u(t), T=2_\n\n"
-        "4️⃣ *Fourier Series*\n"
+        "4. *Fourier Series*\n"
         "   _fourier series of t**2, T=2*pi_\n\n"
-        "5️⃣ *Convolution*\n"
+        "5. *Convolution*\n"
         "   _convolve e^(-t)*u(t) with u(t)_\n\n"
-        "6️⃣ *Plot signals*\n"
+        "6. *Plot signals*\n"
         "   Continuous: _plot 2*u(t-2)_  or  _show me what u(t) looks like_\n"
         "   Discrete:   _draw u[n]-u[n-3]_\n\n"
-        "7️⃣ *Upload a PDF or image file*\n"
-        "   Send the file → bot loads it as session context\n"
-        "   Then send a follow-up message:\n"
+        "7. *Upload a PDF or image file*\n"
+        "   Send the file then follow up with:\n"
         "     _explain how Question 1(b) was solved_\n"
         "     _answer Question 2(a)_\n"
         "     _give me two practice problems like Question 3_\n"
         "     _mark my work against this memo_\n"
-        "   ⚠️ Uploaded files are session-only — not saved permanently.\n\n"
-        "8️⃣ *Handwritten photo or question image*\n"
-        "   📌 With caption → bot follows your instruction\n"
-        "   📌 No caption   → bot reads the question and solves it automatically\n"
-        "   📌 Diagrams (block diagrams, signal flow graphs) described structurally\n\n"
-        "9️⃣ *Mark calculator*\n"
+        "   Uploaded files are session-only — not saved permanently.\n\n"
+        "8. *Handwritten photo or question image*\n"
+        "   With caption → bot follows your instruction\n"
+        "   No caption   → bot reads the question and solves it automatically\n"
+        "   Diagrams (block diagrams, signal flow graphs) described structurally\n\n"
+        "9. *Mark calculator*\n"
         "   _how much do I need to pass_\n\n"
-        "💡 Use * for multiply, ** for power\n"
-        "   e.g. e**(-2*t)*u(t)  or  e^-2t*u(t)",
+        "Use * for multiply, ** for power\n"
+        "e.g. e**(-2*t)*u(t)  or  e^-2t*u(t)",
         parse_mode="Markdown"
     )
 
@@ -2322,10 +2318,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 session_store(chat_id, extracted, "Handwritten photo / diagram")
                 await update.message.reply_text(
                     "Photo loaded. What would you like me to do?\n"
-                    "  • _Solve this_\n"
-                    "  • _Explain step by step_\n"
-                    "  • _What is this question asking?_\n"
-                    "  • _Describe this diagram_")
+                    "  - Solve this\n"
+                    "  - Explain step by step\n"
+                    "  - What is this question asking?\n"
+                    "  - Describe this diagram")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2374,10 +2370,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Content loaded from *{source}*.\n\n"
         f"Preview: _{preview}…_\n\n"
         f"Now tell me what you'd like me to do:\n"
-        f"  • _Explain how Question 1(b) was solved_\n"
-        f"  • _Answer Question 2(a)_\n"
-        f"  • _Give me two practice problems like Question 3_\n"
-        f"  • _Mark my work against this memo_",
+        f"  - Explain how Question 1(b) was solved\n"
+        f"  - Answer Question 2(a)\n"
+        f"  - Give me two practice problems like Question 3\n"
+        f"  - Mark my work against this memo",
         parse_mode="Markdown")
 
     if caption:
@@ -2387,7 +2383,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏳ Also acting on your caption: _{caption}_…",
             parse_mode="Markdown")
         response = _call_llm(prompt)
-        await send_llm_response(update, response, f"Answer — {source}", msg_id=update.message.message_id)
+        await send_llm_response(update, response, f"Answer — {source}",
+                                msg_id=update.message.message_id)
         session_clear(chat_id)
         await update.message.reply_text(
             "_(Session cleared — uploaded file no longer in memory.)_",
