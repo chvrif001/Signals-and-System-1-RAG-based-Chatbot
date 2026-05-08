@@ -40,13 +40,7 @@ ADMIN_USER_ID     = int(os.environ.get("ADMIN_USER_ID", "0"))
 
 LLM_MODEL    = "meta-llama/Meta-Llama-3-8B-Instruct-Lite"
 
-# ── API endpoints ─────────────────────────────────────────────────────────────
 TOGETHER_ENDPOINT = "https://api.together.xyz/v1/chat/completions"
-
-
-def _get_endpoint(model: str) -> str:
-    return TOGETHER_ENDPOINT
-
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 PDF_FOLDER  = "./knowledge_base"
@@ -97,11 +91,8 @@ a_sym = sp.Symbol("a",     positive=True)
 def _normalise(expr: str) -> str:
     s = expr.strip()
     s = s.replace("^", "**").replace("{", "(").replace("}", ")")
-
-    # explicit u(t) and u(t±a) shorthand BEFORE the generic u(...) rule
     s = re.sub(r'\bu\s*\(\s*t\s*\)', 'Heaviside(t)', s)
     s = re.sub(r'\bu\s*\(\s*t\s*([+-][^)]+)\)', r'Heaviside(t\1)', s)
-
     s = re.sub(r'\bE\*\*(-[^\s\*\+\-\(\),]+)', r'E**(\1)', s)
     s = re.sub(r'\be\*\*(-[^\s\*\+\-\(\),]+)', r'E**(\1)', s)
     s = re.sub(r'(\d)(t\b)',               r'\1*\2', s)
@@ -215,64 +206,35 @@ def extract_expr(question: str) -> str | None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _sympy_to_latex(expr: sp.Expr) -> str:
-    """Convert a SymPy expression to a LaTeX string."""
     return sp.latex(expr)
 
 
-# ── mathtext sanitiser (Matplotlib mathtext subset) ───────────────────────────
 def _sanitise_mathtext(s: str) -> str:
-    """
-    Convert full LaTeX to the subset supported by Matplotlib mathtext.
-    Key restrictions: no \\mathcal, no \\operatorname, no \\text with spaces.
-    Also fixes SymPy-specific output quirks before rendering.
-    All regex patterns use raw strings to avoid Python escape issues.
-    """
-    # ── SymPy quirks ──────────────────────────────────────────────────────────
-    # SymPy renders Heaviside(t) as \theta\left(t\right) — fix to u(t)
     s = re.sub(r'\\theta\\left\(([^)]+)\\right\)', r'u(\1)', s)
     s = s.replace(r'\theta\left(t\right)', r'u(t)')
-    # SymPy uses imaginary 'i' — replace with engineering 'j'
-    # Only standalone i (not inside variable names like 'pi', 'sin', etc.)
     s = re.sub(r'(?<![a-zA-Z\\])i(?![a-zA-Z0-9{])', r'j', s)
-
-    # ── Unsupported font commands ──────────────────────────────────────────────
-    # \mathcal{X} and \mathscr{X} → bold (mathtext has no calligraphic font)
     s = re.sub(r'\\mathcal\{([^}]+)\}',  r'\\mathbf{\1}', s)
     s = re.sub(r'\\mathscr\{([^}]+)\}',  r'\\mathbf{\1}', s)
-    # \mathrm{…} → supported as \rm in mathtext
     s = re.sub(r'\\mathrm\{([^}]+)\}',   r'\\rm \1',      s)
-    # \operatorname{…} → treat same as \mathrm
     s = re.sub(r'\\operatorname\{([^}]+)\}', r'\\rm \1',  s)
-    # \text{…} → plain upright text
     s = re.sub(r'\\text\{([^}]*)\}',     r'\\rm \1',      s)
-
-    # ── Spacing ───────────────────────────────────────────────────────────────
     s = s.replace(r'\qquad', r'\ \ \ \ ')
     s = s.replace(r'\quad',  r'\ \ ')
     s = s.replace(r'\,',     r'\ ')
     s = s.replace(r'\;',     r'\ ')
-
-    # ── \left / \right — optional size hints, strip them (keep the bracket) ──
     s = re.sub(r'\\left\s*',  '', s)
     s = re.sub(r'\\right\s*', '', s)
-
     return s
 
 
 def _try_render_row(ax, x_label: float, x_expr: float, y: float,
                     label: str, latex_str: str, fontsize: int = 20) -> None:
-    """
-    Draw one label + expression row on `ax`.
-    Tries mathtext first; falls back to monospace plain text.
-    """
     ax.text(x_label, y, f"{label}:",
             transform=ax.transAxes,
             fontsize=fontsize - 1, fontweight="bold",
             color="#0055aa", va="top", ha="left", usetex=False)
-
     if not latex_str:
         return
-
     safe = _sanitise_mathtext(latex_str)
     try:
         ax.text(x_expr, y, f"${safe}$",
@@ -288,17 +250,13 @@ def _try_render_row(ax, x_label: float, x_expr: float, y: float,
 
 
 def _render_math_png(title: str, steps: list[tuple[str, str]], msg_id: int) -> str | None:
-    """
-    Render a list of (label, latex_expr) pairs as a clean PNG.
-    Width is fixed; height grows with the number of rows so text is never tiny.
-    """
     try:
         n       = len(steps)
-        FONT    = 20          # base font size (pt) — large and readable on mobile
-        ROW_IN  = 0.80        # inches per row
-        PAD_IN  = 1.4         # inches for title + padding
+        FONT    = 20
+        ROW_IN  = 0.80
+        PAD_IN  = 1.4
         fig_h   = max(3.0, n * ROW_IN + PAD_IN)
-        fig_w   = 12.0         # narrower → larger effective text on screen
+        fig_w   = 12.0
 
         fig, ax = plt.subplots(figsize=(fig_w, fig_h), facecolor="white")
         ax.set_facecolor("white")
@@ -306,22 +264,18 @@ def _render_math_png(title: str, steps: list[tuple[str, str]], msg_id: int) -> s
         ax.set_xlim(0, 1)
         ax.set_ylim(0, 1)
 
-        # ── Title ──────────────────────────────────────────────────────────
-        # Strip emoji from title (not in DejaVu font)
         title_clean = re.sub(r'[^\x00-\x7F]+', '', title).strip()
         ax.text(0.5, 0.97, title_clean,
                 transform=ax.transAxes,
                 fontsize=FONT + 3, fontweight="bold",
                 ha="center", va="top", color="#1a1a2e", usetex=False)
 
-        # ── Divider ────────────────────────────────────────────────────────
         divider_y = 1.0 - (PAD_IN * 0.45 / fig_h)
         ax.plot([0.01, 0.99], [divider_y, divider_y],
                 color="#aaaaaa", linewidth=1.2,
                 transform=ax.transAxes)
 
-        # ── Rows ───────────────────────────────────────────────────────────
-        row_frac = ROW_IN / fig_h          # fraction of figure height per row
+        row_frac = ROW_IN / fig_h
         y = divider_y - (0.15 / fig_h) - row_frac * 0.15
 
         for label, latex_str in steps:
@@ -335,7 +289,6 @@ def _render_math_png(title: str, steps: list[tuple[str, str]], msg_id: int) -> s
         fig.savefig(path, dpi=180, bbox_inches="tight",
                     facecolor="white", edgecolor="none")
         plt.close("all")
-        print(f"[render] PNG saved → {path}  ({n} rows, {fig_w}×{fig_h:.1f} in)")
         return path
     except Exception as e:
         print(f"[_render_math_png] FAILED: {e}")
@@ -347,7 +300,6 @@ def _render_math_png(title: str, steps: list[tuple[str, str]], msg_id: int) -> s
 # ── Per-operation step builders ───────────────────────────────────────────────
 
 def _build_laplace_steps(expr_str: str) -> tuple[list[tuple[str, str]], str]:
-    """Returns (steps, error_string). steps is empty on error."""
     steps: list[tuple[str, str]] = []
     try:
         f      = parse_ct_expr(expr_str)
@@ -399,9 +351,7 @@ def _build_fourier_steps(expr_str: str) -> tuple[list[tuple[str, str]], str]:
         steps.append(("Known pair", rule))
 
         result     = _fourier_direct(f)
-        # Replace SymPy's imaginary I with j for engineering notation
         result_tex = _sympy_to_latex(result).replace(r"\mathbf{i}", "j").replace(" i ", " j ").replace("{i}", "{j}")
-        # Fix common SymPy latex issues: I → j
         result_tex = re.sub(r'(?<![a-zA-Z])i(?![a-zA-Z])', 'j', result_tex)
         steps.append(("Result", rf"F(\omega) = {result_tex}"))
 
@@ -462,15 +412,10 @@ def _build_fourier_series_steps(expr_str: str, period: float,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CONVOLUTION — FIXED (smart limit selector)
+# CONVOLUTION
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _simplify_heaviside_powers(expr: sp.Expr) -> sp.Expr:
-    """
-    Collapse Heaviside(x)**n  →  Heaviside(x) for any integer n >= 1.
-    SymPy does not do this automatically, so unsimplified results like
-    (t-5)*Heaviside(t-5)**2 must be cleaned up here.
-    """
     return expr.replace(
         lambda e: e.is_Pow and isinstance(e.base, sp.Heaviside) and e.exp.is_positive,
         lambda e: e.base
@@ -478,77 +423,27 @@ def _simplify_heaviside_powers(expr: sp.Expr) -> sp.Expr:
 
 
 def _extract_heaviside_onset(expr: sp.Expr) -> sp.Expr | None:
-    """
-    Given a SymPy expression, find the onset (lower bound) of the first
-    Heaviside factor.  Returns the delay constant `d` where the signal
-    is nonzero for t >= d, or None if no Heaviside is found.
-
-    Examples:
-      Heaviside(t)      → 0
-      Heaviside(t - 5)  → 5
-      Heaviside(t + 2)  → -2
-    """
     for arg in sp.preorder_traversal(expr):
         if isinstance(arg, sp.Heaviside):
-            inner = arg.args[0]   # the argument of Heaviside, e.g. t-5
-            # inner = t - d  →  d = t - inner  evaluated at t=0 gives -inner|_{t=0}
-            # More robustly: solve inner = 0 for t
+            inner = arg.args[0]
             sol = sp.solve(inner, t_sym)
             if sol:
                 return sol[0]
-            # If it's just `t`, onset is 0
             if inner == t_sym:
                 return sp.Integer(0)
     return None
 
 
 def _compute_causal_limits(f: sp.Expr, g: sp.Expr):
-    """
-    Determine the correct symbolic integration limits for the convolution
-    integral  ∫ f(τ) g(t−τ) dτ  when both signals are causal (Heaviside-gated).
-
-    Strategy
-    --------
-    After substituting τ into f and (t−τ) into g:
-      • f(τ)    is nonzero for τ ≥ d_f   (d_f = onset of f)
-      • g(t−τ)  is nonzero for t−τ ≥ d_g, i.e. τ ≤ t − d_g
-
-    So the correct limits are  (d_f,  t − d_g).
-
-    Returns (lower, upper) as SymPy expressions, or None to signal that
-    full limits (-∞, ∞) should be used instead.
-    """
     d_f = _extract_heaviside_onset(f)
     d_g = _extract_heaviside_onset(g)
-
     if d_f is None or d_g is None:
-        return None   # at least one signal has no Heaviside — use full limits
-
-    lower = d_f
-    upper = t_sym - d_g
-    return lower, upper
+        return None
+    return d_f, t_sym - d_g
 
 
 def _build_convolution_steps(expr1_str: str, expr2_str: str,
                               msg_id: int) -> tuple[list[tuple[str, str]], str, str | None]:
-    """
-    Returns (steps, error_string, plot_path).
-
-    STRATEGY
-    --------
-    1. If both signals are Heaviside-gated, extract each signal's onset delay
-       analytically and set exact limits (d_f, t − d_g).  This handles both
-       the plain  u(t) ★ u(t)  case  (limits 0 → t, result = t·u(t))  and the
-       delayed  u(t) ★ u(t−5)  case  (limits 0 → t−5, result = (t−5)·u(t−5))
-       without ever leaving a Heaviside² in the result.
-
-    2. If either signal has no Heaviside (e.g. a decaying exponential without
-       an explicit step), fall back to full limits (-∞, ∞) and let SymPy
-       handle the Heaviside internally.
-
-    3. After integration, call _simplify_heaviside_powers() to collapse any
-       residual Heaviside(x)**n → Heaviside(x).
-    """
     steps: list[tuple[str, str]] = []
     plot_path = None
 
@@ -570,7 +465,6 @@ def _build_convolution_steps(expr1_str: str, expr2_str: str,
                    rf"f(\tau)={_sympy_to_latex(f_tau)},\quad g(t-\tau)={_sympy_to_latex(g_shift)}"))
     steps.append(("Integrand",   _sympy_to_latex(integrand)))
 
-    # ── Choose integration limits analytically ────────────────────────────────
     causal_limits = _compute_causal_limits(f, g)
 
     if causal_limits is not None:
@@ -588,16 +482,11 @@ def _build_convolution_steps(expr1_str: str, expr2_str: str,
     try:
         result = sp.integrate(integrand, limits)
         result = sp.simplify(result)
-
-        # Collapse Heaviside(x)**n → Heaviside(x) (SymPy doesn't do this automatically)
         result = _simplify_heaviside_powers(result)
-
         if result.has(sp.Integral):
             raise ValueError("unevaluated integral")
-
         steps.append(("Result", rf"(f\star g)(t) = {_sympy_to_latex(result)}"))
         plot_path = _numerical_convolution_plot(f, g, msg_id)
-
     except Exception as e:
         steps.append(("Note", rf"\text{{Symbolic integration failed: {str(e)[:60]}}}"))
         steps.append(("Fallback", r"\text{See numerical plot}"))
@@ -708,7 +597,6 @@ def generate_plot(question: str, msg_id: int) -> str | None:
 # LAPLACE TRANSFORM
 # ══════════════════════════════════════════════════════════════════════════════
 def _identify_laplace_rule(expr: sp.Expr) -> str:
-    """Plain-text rule description (used in text fallback only)."""
     s = str(expr)
     if "DiracDelta" in s:
         return "Unit impulse:   L{δ(t)} = 1"
@@ -728,7 +616,6 @@ def _identify_laplace_rule(expr: sp.Expr) -> str:
 
 
 def _identify_laplace_rule_latex(expr: sp.Expr) -> str:
-    """LaTeX rule string (used in PNG renderer)."""
     s = str(expr)
     if "DiracDelta" in s:
         return r"\mathcal{L}\{\delta(t)\} = 1"
@@ -748,7 +635,6 @@ def _identify_laplace_rule_latex(expr: sp.Expr) -> str:
 
 
 def compute_laplace(expr_str: str) -> str:
-    """Kept as plain-text fallback."""
     lines = ["━━━ 📐 LAPLACE TRANSFORM ━━━\n"]
     lines.append(f"Input:  f(t) = {expr_str}\n")
     lines.append("Definition:  F(s) = ∫₀^∞  f(t) · e^(-st) dt\n")
@@ -790,7 +676,6 @@ def compute_laplace(expr_str: str) -> str:
 # FOURIER TRANSFORM
 # ══════════════════════════════════════════════════════════════════════════════
 def _identify_fourier_rule(expr: sp.Expr) -> str:
-    """Plain-text rule description (used in text fallback only)."""
     s = str(expr)
     if "DiracDelta" in s:
         return "Impulse:   F{δ(t)} = 1"
@@ -808,7 +693,6 @@ def _identify_fourier_rule(expr: sp.Expr) -> str:
 
 
 def _identify_fourier_rule_latex(expr: sp.Expr) -> str:
-    """LaTeX rule string (used in PNG renderer)."""
     s = str(expr)
     if "DiracDelta" in s:
         return r"\mathcal{F}\{\delta(t)\} = 1"
@@ -826,16 +710,6 @@ def _identify_fourier_rule_latex(expr: sp.Expr) -> str:
 
 
 def _fourier_direct(f: sp.Expr) -> sp.Expr:
-    """
-    Compute F(ω) = ∫_{-∞}^{∞} f(t) e^{-jωt} dt symbolically.
-    Falls back to a table of known pairs for non-L¹-integrable signals.
-
-    FIX (line 784-785 area): the Heaviside branch now extracts any scalar
-    coefficient from f before looking up the table pair, then scales the
-    result.  Previously 2*u(t) returned πδ(ω)+1/(jω) instead of
-    2πδ(ω)+2/(jω).
-    """
-    # ── 1. Try direct symbolic integration first ───────────────────────────
     try:
         result = sp.integrate(
             f * sp.exp(-sp.I * w_sym * t_sym),
@@ -848,25 +722,18 @@ def _fourier_direct(f: sp.Expr) -> sp.Expr:
 
     s = str(f)
 
-    # ── 2. cos(ω₀t) ───────────────────────────────────────────────────────
     if "cos" in s:
         m = re.search(r'cos\(\s*([^)]+?)\s*\*?\s*t\b', str(f))
         if m:
             w0 = sp.sympify(m.group(1).strip(), locals=_COMMON_NS)
             return sp.pi * (sp.DiracDelta(w_sym - w0) + sp.DiracDelta(w_sym + w0))
 
-    # ── 3. sin(ω₀t) ───────────────────────────────────────────────────────
     if "sin" in s:
         m = re.search(r'sin\(\s*([^)]+?)\s*\*?\s*t\b', str(f))
         if m:
             w0 = sp.sympify(m.group(1).strip(), locals=_COMMON_NS)
             return sp.I * sp.pi * (sp.DiracDelta(w_sym + w0) - sp.DiracDelta(w_sym - w0))
 
-    # ── 4. Scaled u(t)  —  THE FIX ────────────────────────────────────────
-    # For expressions like 2*u(t), 0.5*u(t), a*u(t) we must extract the
-    # scalar multiplier BEFORE returning the table pair.  Without this step
-    # the multiplier is silently dropped and the result is always the pair
-    # for plain u(t), i.e. πδ(ω) + 1/(jω).
     if "Heaviside" in s and "exp" not in s:
         coeff = sp.Integer(1)
         if f.is_Mul:
@@ -879,11 +746,9 @@ def _fourier_direct(f: sp.Expr) -> sp.Expr:
                     other_factors.append(arg)
             if numeric_factors:
                 coeff = sp.Mul(*numeric_factors)
-        # Table pair for u(t):  πδ(ω) + 1/(jω)
         pair = sp.pi * sp.DiracDelta(w_sym) + 1 / (sp.I * w_sym)
         return sp.simplify(coeff * pair)
 
-    # ── 5. Constant 1  ────────────────────────────────────────────────────
     if f == sp.Integer(1):
         return 2 * sp.pi * sp.DiracDelta(w_sym)
 
@@ -891,7 +756,6 @@ def _fourier_direct(f: sp.Expr) -> sp.Expr:
 
 
 def compute_fourier(expr_str: str) -> str:
-    """Kept as plain-text fallback."""
     lines = ["━━━ 📡 FOURIER TRANSFORM ━━━\n"]
     lines.append(f"Input:  f(t) = {expr_str}\n")
     lines.append("Definition:  F(ω) = ∫₋∞^∞  f(t) · e^(-jωt) dt\n")
@@ -946,7 +810,6 @@ def _extract_period(text: str) -> float | None:
 
 
 def compute_fourier_series(expr_str: str, period: float, n_terms: int = 5) -> str:
-    """Kept as plain-text fallback."""
     lines = ["━━━ 🎵 FOURIER SERIES ━━━\n"]
     lines.append(f"Input:   f(t) = {expr_str}")
     lines.append(f"Period:  T = {period:.4g}\n")
@@ -988,7 +851,7 @@ def compute_fourier_series(expr_str: str, period: float, n_terms: int = 5) -> st
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CONVOLUTION — plain-text fallback (also fixed)
+# CONVOLUTION — plain-text fallback
 # ══════════════════════════════════════════════════════════════════════════════
 def _parse_two_signals(text: str):
     m = re.split(r'\bwith\b|\band\b|\*|\bstar\b', text, maxsplit=1,
@@ -1035,10 +898,6 @@ def _numerical_convolution_plot(f_expr: sp.Expr, g_expr: sp.Expr,
 
 
 def compute_convolution(expr1_str: str, expr2_str: str, msg_id: int = 0):
-    """
-    Plain-text fallback for convolution.
-    Uses the same smart limit selector as _build_convolution_steps.
-    """
     lines = ["━━━ 🔁 CONVOLUTION ━━━\n"]
     lines.append(f"f(t) = {expr1_str}")
     lines.append(f"g(t) = {expr2_str}\n")
@@ -1070,7 +929,6 @@ def compute_convolution(expr1_str: str, expr2_str: str, msg_id: int = 0):
     try:
         result = sp.integrate(integrand, limits)
         result = sp.simplify(result)
-        # Collapse Heaviside(x)**n → Heaviside(x)
         result = _simplify_heaviside_powers(result)
         if result.has(sp.Integral):
             raise ValueError("SymPy returned unevaluated integral")
@@ -1297,7 +1155,226 @@ def _extract_pdf_bytes(pdf_bytes: bytes) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SESSION-AWARE LLM CALLS
+# ★ NEW: DOCUMENT PARSER — Feature 3
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Patterns for question number detection
+_Q_MAIN    = re.compile(
+    r'(?:^|\n)\s*(?:Question|Q\.?)\s*(\d+)\b[^\n]*',
+    re.IGNORECASE
+)
+_Q_SUB     = re.compile(
+    r'(?:^|\n)\s*(?:(\d+)[\.\)]\s*([a-zA-Z])[\.\)]|'          # 1.a) or 1a)
+    r'\(([a-zA-Z])\)|'                                          # (a)
+    r'([a-zA-Z])[\.\)])',                                       # a) or a.
+    re.IGNORECASE
+)
+
+
+def _build_question_index(doc_text: str) -> list[dict]:
+    """
+    Parse the document and return a list of question blocks, each with:
+      { 'id': '1', 'sub': 'a', 'start': int, 'end': int, 'text': str }
+
+    The 'end' of each block is the start of the next block (or EOF).
+    Main question preambles (introductory text before sub-questions) are tagged
+    as sub=None so they can be prepended as context.
+    """
+    blocks = []
+    lines  = doc_text.split('\n')
+    pos    = 0
+
+    # Walk line by line; record where each question/sub-question starts
+    spans  = []  # (start_char, question_id, sub_id)
+    char_pos = 0
+
+    for line in lines:
+        stripped = line.strip()
+
+        # Main question header: "Question 1", "Q2", "Q 3", etc.
+        m_main = re.match(
+            r'^(?:Question|Q\.?)\s*(\d+)\b',
+            stripped, re.IGNORECASE
+        )
+        if m_main:
+            spans.append((char_pos, m_main.group(1), None))
+
+        # Sub-question: "(a)", "a)", "1.a)", "(i)", "i)", etc.
+        m_sub = re.match(
+            r'^\(?([a-zA-Z]{1,2}|[ivxlIVXL]+)\)?[\.\)]\s',
+            stripped
+        )
+        if m_sub and spans:
+            # Only treat as sub-question if we are already inside a main question
+            spans.append((char_pos, spans[-1][1] if spans else None,
+                           m_sub.group(1).lower()))
+
+        char_pos += len(line) + 1  # +1 for the newline
+
+    # Convert spans to blocks with start/end and text
+    for i, (start, qid, sub) in enumerate(spans):
+        end   = spans[i + 1][0] if i + 1 < len(spans) else len(doc_text)
+        text  = doc_text[start:end].strip()
+        blocks.append({'id': str(qid) if qid else None,
+                       'sub': sub,
+                       'start': start,
+                       'end':   end,
+                       'text':  text})
+
+    return blocks
+
+
+def extract_question_with_context(doc_text: str, instruction: str) -> str:
+    """
+    Feature 3 core function.
+
+    Given the full document text and an instruction like "Answer Question 1(a)",
+    locate:
+      1. The main question preamble (definitions, signals, given information)
+      2. The specific sub-question text
+
+    Returns a combined context string to be passed to the LLM, or the original
+    instruction if no specific question can be resolved.
+    """
+    # Parse what the student asked for
+    m = re.search(
+        r'[Qq](?:uestion)?\s*(\d+)\s*[\.\(]?\s*([a-zA-Z])?',
+        instruction
+    )
+    if not m:
+        return instruction  # No recognisable question reference — return as-is
+
+    target_q   = m.group(1)
+    target_sub = m.group(2).lower() if m.group(2) else None
+
+    blocks = _build_question_index(doc_text)
+
+    # Find all blocks that belong to this question number
+    q_blocks = [b for b in blocks if b['id'] == target_q]
+    if not q_blocks:
+        return instruction
+
+    # The preamble is the first block of this question (sub=None) or the block
+    # immediately before any sub-questions — it typically contains definitions
+    # of signals, given parameters, etc.
+    preamble_blocks = [b for b in q_blocks if b['sub'] is None]
+    preamble_text   = "\n\n".join(b['text'] for b in preamble_blocks).strip()
+
+    if target_sub is None:
+        # Asked for the whole question
+        full_text = "\n\n".join(b['text'] for b in q_blocks).strip()
+        return (
+            f"The student is asking about Question {target_q}.\n\n"
+            f"--- Extracted question text ---\n{full_text}\n\n"
+            f"--- Student instruction ---\n{instruction}"
+        )
+
+    # Find the specific sub-question
+    sub_blocks = [b for b in q_blocks if b['sub'] == target_sub]
+    if not sub_blocks:
+        # Sub-question not found — still return preamble + instruction
+        context = preamble_text or "(No preamble found)"
+        return (
+            f"The student is asking about Question {target_q}({target_sub}).\n\n"
+            f"--- Question {target_q} preamble / definitions ---\n{context}\n\n"
+            f"--- Student instruction ---\n{instruction}\n\n"
+            f"Note: The specific sub-question text could not be found. "
+            f"Use the preamble and the student's instruction to answer."
+        )
+
+    sub_text = "\n\n".join(b['text'] for b in sub_blocks).strip()
+
+    parts = [f"The student is asking about Question {target_q}({target_sub})."]
+    if preamble_text:
+        parts.append(
+            f"--- Question {target_q} preamble / definitions "
+            f"(definitions and given information) ---\n{preamble_text}"
+        )
+    parts.append(
+        f"--- Question {target_q}({target_sub}) text ---\n{sub_text}"
+    )
+    parts.append(f"--- Student instruction ---\n{instruction}")
+
+    return "\n\n".join(parts)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ★ NEW: AUTO-ROUTE OCR OUTPUT — Feature 4
+# ══════════════════════════════════════════════════════════════════════════════
+
+def auto_route_extracted_text(extracted: str) -> str | None:
+    """
+    Feature 4: given OCR-extracted text, detect whether it contains a
+    Signals & Systems math problem and return a normalised command string
+    that can be passed directly to the existing math pipeline.
+
+    Returns a string like "laplace of e**(-2*t)*u(t)" if a transform is
+    detected, or None if the text should fall back to the LLM.
+    """
+    lower = extracted.lower()
+
+    # ── Laplace ───────────────────────────────────────────────────────────────
+    m_lap = re.search(
+        r'(?:find|compute|determine|calculate)?\s*'
+        r'(?:the\s+)?laplace\s+(?:transform\s+)?(?:of\s+)?(.+)',
+        lower, re.IGNORECASE | re.DOTALL
+    )
+    if m_lap:
+        expr = m_lap.group(1).strip().split('\n')[0].strip(' .')
+        return f"laplace of {expr}"
+
+    # ── Inverse Laplace ───────────────────────────────────────────────────────
+    m_ilap = re.search(
+        r'inverse\s+laplace\s+(?:transform\s+)?(?:of\s+)?(.+)',
+        lower, re.IGNORECASE | re.DOTALL
+    )
+    if m_ilap:
+        expr = m_ilap.group(1).strip().split('\n')[0].strip(' .')
+        return f"inverse laplace of {expr}"
+
+    # ── Fourier Transform ─────────────────────────────────────────────────────
+    m_ft = re.search(
+        r'(?:find|compute|determine|calculate)?\s*'
+        r'(?:the\s+)?fourier\s+transform\s+(?:of\s+)?(.+)',
+        lower, re.IGNORECASE | re.DOTALL
+    )
+    if m_ft:
+        expr = m_ft.group(1).strip().split('\n')[0].strip(' .')
+        return f"fourier transform of {expr}"
+
+    # ── Fourier Series ────────────────────────────────────────────────────────
+    m_fs = re.search(
+        r'fourier\s+series\s+(?:of\s+)?(.+)',
+        lower, re.IGNORECASE | re.DOTALL
+    )
+    if m_fs:
+        expr = m_fs.group(1).strip().split('\n')[0].strip(' .')
+        return f"fourier series of {expr}"
+
+    # ── Convolution ───────────────────────────────────────────────────────────
+    m_conv = re.search(
+        r'(?:find|compute|determine)?\s*(?:the\s+)?convolution\s+(?:of\s+)?(.+)',
+        lower, re.IGNORECASE | re.DOTALL
+    )
+    if m_conv:
+        expr = m_conv.group(1).strip().split('\n')[0].strip(' .')
+        return f"convolve {expr}"
+
+    # ── Plot request ──────────────────────────────────────────────────────────
+    m_plot = re.search(
+        r'(?:sketch|plot|draw|graph)\s+(?:the\s+signal\s+)?(.+)',
+        lower, re.IGNORECASE | re.DOTALL
+    )
+    if m_plot:
+        expr = m_plot.group(1).strip().split('\n')[0].strip(' .')
+        return f"plot {expr}"
+
+    # ── Nothing matched — fall back to LLM ────────────────────────────────────
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SESSION-AWARE LLM CALLS — enriched prompt templates (Features 1 & 2)
 # ══════════════════════════════════════════════════════════════════════════════
 _SESSION_RULES = """IMPORTANT — follow strictly:
 1. The uploaded document is the PRIMARY and authoritative source of truth.
@@ -1309,6 +1386,52 @@ _SESSION_RULES = """IMPORTANT — follow strictly:
    interpretation — do not silently substitute your own answer."""
 
 
+# ── Feature 1: Explain memo step-by-step with simplified language ─────────────
+def _prompt_explain_memo(doc_text: str, instruction: str) -> str:
+    return (
+        f"{_SESSION_RULES}\n\n"
+        f"You are a patient, encouraging Signals and Systems tutor.\n\n"
+        f"Uploaded memorandum / model solution:\n\"\"\"\n{doc_text}\n\"\"\"\n\n"
+        f"Student instruction: {instruction}\n\n"
+        f"Your task:\n"
+        f"1. Identify the question or solution section the student is asking about.\n"
+        f"2. Re-explain the solution step-by-step using simple language a first-year "
+        f"student can follow. Number each step clearly.\n"
+        f"3. For EVERY formula or mathematical symbol used, add a one-line plain-English "
+        f"explanation of what it means and why it is applied at that step.\n"
+        f"4. After the explanation, generate TWO similar practice problems with "
+        f"different signal parameters. For each, state the problem clearly, then provide "
+        f"the worked solution.\n"
+        f"5. End with one short study tip specific to this technique.\n"
+        f"Be concise but thorough. Use numbered steps."
+    )
+
+
+# ── Feature 2: Mark student answer with structured feedback ───────────────────
+def _prompt_mark(memo_text: str, student_work: str) -> str:
+    return (
+        f"{_SESSION_RULES}\n\n"
+        f"Memo / expected solution (from uploaded file):\n\"\"\"\n{memo_text}\n\"\"\"\n\n"
+        f"Student's work:\n\"\"\"\n{student_work}\n\"\"\"\n\n"
+        f"Your task:\n"
+        f"1. OVERALL VERDICT: State one of CORRECT / PARTIALLY CORRECT / INCORRECT.\n"
+        f"2. MARKS: Estimate marks earned out of the total available "
+        f"(use the memo's mark allocation if visible, otherwise use your judgement).\n"
+        f"3. WHAT IS CORRECT: List every step or element the student got right. "
+        f"Acknowledge partial credit where the approach is sound but execution is flawed.\n"
+        f"4. ERRORS: For each mistake, state:\n"
+        f"   a) What the student wrote\n"
+        f"   b) What it should be\n"
+        f"   c) The concept they missed\n"
+        f"5. IMPROVEMENT: Give a concise explanation of how to correct each error, "
+        f"referencing the memo solution.\n"
+        f"6. ENCOURAGEMENT: End with one specific, genuine encouragement statement "
+        f"based on what the student demonstrated.\n"
+        f"Format each section clearly with its heading."
+    )
+
+
+# ── Feature 2 / existing: Solve a question from the uploaded document ─────────
 def _prompt_solve(doc_text: str, instruction: str) -> str:
     return (
         f"{_SESSION_RULES}\n\n"
@@ -1319,20 +1442,7 @@ def _prompt_solve(doc_text: str, instruction: str) -> str:
     )
 
 
-def _prompt_mark(memo_text: str, student_work: str) -> str:
-    return (
-        f"{_SESSION_RULES}\n\n"
-        f"Memo / expected solution (from uploaded file):\n\"\"\"\n{memo_text}\n\"\"\"\n\n"
-        f"Student's work (OCR extracted):\n\"\"\"\n{student_work}\n\"\"\"\n\n"
-        f"Your task:\n"
-        f"1. State CORRECT, PARTIALLY CORRECT, or INCORRECT.\n"
-        f"2. Identify every error or missing step clearly.\n"
-        f"3. Explain the correct approach for each error.\n"
-        f"4. Acknowledge what the student did right.\n"
-        f"Be encouraging and specific."
-    )
-
-
+# ── General explanation ────────────────────────────────────────────────────────
 def _prompt_explain(doc_text: str, question: str) -> str:
     return (
         f"{_SESSION_RULES}\n\n"
@@ -1346,7 +1456,7 @@ def _prompt_explain(doc_text: str, question: str) -> str:
     )
 
 
-def _call_llm(prompt: str, max_tokens: int = 1500) -> str:
+def _call_llm(prompt: str, max_tokens: int = 1800) -> str:
     payload = {
         "model": LLM_MODEL,
         "max_tokens": max_tokens,
@@ -1366,13 +1476,42 @@ def _call_llm(prompt: str, max_tokens: int = 1500) -> str:
 
 
 def _route_session_prompt(doc_text: str, instruction: str) -> str:
+    """
+    Route an instruction to the correct prompt template.
+    Now handles the 'explain memo' and 'practice examples' flows (Feature 1)
+    in addition to mark/solve/explain.
+    """
     instr_lower = instruction.lower()
-    if any(kw in instr_lower for kw in ["mark", "check", "compare", "correct",
-                                          "feedback", "evaluate", "grade"]):
+
+    # Feature 1 triggers — explain memo / generate practice problems
+    if any(kw in instr_lower for kw in [
+        "explain how", "explain question", "how was", "how is", "step by step",
+        "walk me through", "practice", "similar example", "similar problem",
+        "simplify", "what does this mean", "break down"
+    ]):
+        return _prompt_explain_memo(doc_text, instruction)
+
+    # Feature 2 triggers — mark / check student work
+    if any(kw in instr_lower for kw in [
+        "mark", "check", "compare", "correct", "feedback",
+        "evaluate", "grade", "is my answer", "did i get", "how many marks"
+    ]):
         return _prompt_mark(doc_text, instruction)
+
+    # Feature 3 triggers — question extraction with context
+    if re.search(r'[Qq](?:uestion)?\s*\d+', instruction):
+        contextual_instruction = extract_question_with_context(doc_text, instruction)
+        if any(kw in instr_lower for kw in ["solve", "answer", "find", "compute",
+                                             "calculate", "work out", "determine"]):
+            return _prompt_solve(doc_text, contextual_instruction)
+        return _prompt_explain(doc_text, contextual_instruction)
+
+    # Solve / calculate
     if any(kw in instr_lower for kw in ["solve", "calculate", "find", "compute",
                                           "work out", "answer", "determine"]):
         return _prompt_solve(doc_text, instruction)
+
+    # Default — explain
     return _prompt_explain(doc_text, instruction)
 
 
@@ -1498,12 +1637,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "   _fourier series of t, T=2_\n\n"
         "🔁 *Convolution*\n"
         "   _convolve u(t) with e^(-t)*u(t)_\n\n"
-        "📷 *Upload a photo* — send handwritten work or diagrams\n"
+        "📷 *Upload a photo* — handwritten work, diagrams, or question images\n"
         "   With caption → I do what you ask\n"
-        "   No caption   → compared to a loaded memo\n\n"
-        "📄 *Upload a PDF or image* — question paper, memo, textbook\n"
-        "   Sent as a file → loaded as session context\n"
-        "   Then ask: _solve question 3_, _mark my work_, _explain this_\n\n"
+        "   No caption   → I read the question and solve it automatically\n\n"
+        "📄 *Upload a PDF or image file* — question paper, memo, textbook\n"
+        "   Then ask:\n"
+        "   _explain how Question 1 was solved_\n"
+        "   _answer Question 1(a)_\n"
+        "   _mark my work against this memo_\n"
+        "   _give me practice examples like Question 2_\n\n"
         "🧮 *Exam mark calculator* — _how much do I need to pass_\n\n"
         "Use /help for the full guide.",
         parse_mode="Markdown"
@@ -1527,14 +1669,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "6️⃣ *Upload a PDF or image file*\n"
         "   Send the file → bot loads it as session context\n"
         "   Then send a follow-up message:\n"
-        "     _solve question 2b_\n"
+        "     _explain how Question 1(b) was solved_\n"
+        "     _answer Question 2(a)_\n"
+        "     _give me two practice problems like Question 3_\n"
         "     _mark my work against this memo_\n"
-        "     _explain what question 3 is asking_\n"
         "   ⚠️ Uploaded files are session-only — not saved permanently.\n\n"
-        "7️⃣ *Handwritten photo or diagram*\n"
+        "7️⃣ *Handwritten photo or question image*\n"
         "   📌 With caption → bot follows your instruction\n"
-        "   📌 No caption   → compared against loaded session memo\n"
-        "   📌 Diagrams (block diagrams, signal flow graphs) are described structurally\n\n"
+        "   📌 No caption   → bot reads the question and solves it automatically\n"
+        "   📌 Diagrams (block diagrams, signal flow graphs) described structurally\n\n"
         "8️⃣ *Mark calculator*\n"
         "   _how much do I need to pass_\n\n"
         "💡 Use * for multiply, ** for power\n"
@@ -1606,7 +1749,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     photo=open(png, "rb"),
                     caption=f"Laplace Transform of  f(t) = {expr_str}")
             else:
-                # Fallback to plain text
                 await send_long_code(update, compute_laplace(expr_str))
         return
 
@@ -1682,7 +1824,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text_result, plot_path2 = compute_convolution(e1, e2, msg_id)
                 await send_long_code(update, text_result)
                 plot_path = plot_path or plot_path2
-            # Always attach numerical plot if available
             if plot_path and os.path.exists(plot_path):
                 await update.message.reply_photo(
                     photo=open(plot_path, "rb"),
@@ -1718,11 +1859,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PHOTO HANDLER
+# PHOTO HANDLER  (Feature 4: auto-route OCR output to math pipeline)
 # ══════════════════════════════════════════════════════════════════════════════
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = (update.message.caption or "").strip()
     chat_id = update.effective_chat.id
+    msg_id  = update.message.message_id
 
     await update.message.reply_text(
         "📷 Got your photo — running handwriting/diagram recognition… (~15–30s)")
@@ -1735,12 +1877,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f"[handle_photo] Downloaded {len(image_bytes)} bytes")
 
     extracted = _ocr_image_bytes(image_bytes, "jpeg")
-    await update.message.reply_text(
-        f"📝 Extracted content:\n\n{extracted}")
+    await update.message.reply_text(f"📝 Extracted content:\n\n{extracted}")
 
     sess = session_get(chat_id)
 
     if caption:
+        # Caption takes priority — use it as the instruction
         mark_keywords = ["mark", "check", "compare", "grade", "evaluate", "feedback"]
         if sess and any(kw in caption.lower() for kw in mark_keywords):
             await update.message.reply_text(
@@ -1767,21 +1909,116 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "_(Session cleared — uploaded file no longer in memory.)_",
                     parse_mode="Markdown")
     else:
-        if sess:
-            context.user_data["pending_student_work"] = extracted
+        # ── Feature 4: No caption — try to auto-route the extracted question ──
+        routed_command = auto_route_extracted_text(extracted)
+
+        if routed_command:
+            # The OCR found a recognisable math problem — handle it via the
+            # existing text pipeline as if the student typed the command.
             await update.message.reply_text(
-                f"I have *{sess['source']}* loaded as your memo/reference.\n\n"
-                "Reply *mark* to compare your work against it, or tell me what "
-                "else you'd like me to do.",
-                parse_mode="Markdown")
+                f"🔍 Detected question: `{routed_command[:120]}`\n"
+                f"Solving automatically…", parse_mode="Markdown")
+
+            # Synthetic update mock — reuse handle_text logic by temporarily
+            # replacing the message text and calling the router directly.
+            q_lower = routed_command.lower()
+
+            if is_laplace(q_lower):
+                expr_str = extract_expr(routed_command)
+                if expr_str:
+                    steps, err = _build_laplace_steps(expr_str)
+                    if not err:
+                        png = _render_math_png("📐 Laplace Transform", steps, msg_id)
+                        if png and os.path.exists(png):
+                            await update.message.reply_photo(
+                                photo=open(png, "rb"),
+                                caption=f"Laplace Transform of  f(t) = {expr_str}")
+                            return
+                    await send_long_code(update, compute_laplace(expr_str or routed_command))
+                    return
+
+            elif is_fourier(q_lower):
+                expr_str = extract_expr(routed_command)
+                if expr_str:
+                    steps, err = _build_fourier_steps(expr_str)
+                    if not err:
+                        png = _render_math_png("📡 Fourier Transform", steps, msg_id)
+                        if png and os.path.exists(png):
+                            await update.message.reply_photo(
+                                photo=open(png, "rb"),
+                                caption=f"Fourier Transform of  f(t) = {expr_str}")
+                            return
+                    await send_long_code(update, compute_fourier(expr_str or routed_command))
+                    return
+
+            elif is_fs(q_lower):
+                period = _extract_period(routed_command)
+                if period:
+                    expr_str = extract_expr(routed_command)
+                    if expr_str:
+                        steps, err = _build_fourier_series_steps(expr_str, period)
+                        if not err:
+                            png = _render_math_png("🎵 Fourier Series", steps, msg_id)
+                            if png and os.path.exists(png):
+                                await update.message.reply_photo(
+                                    photo=open(png, "rb"),
+                                    caption=f"Fourier Series: f(t)={expr_str}, T={period:.4g}")
+                                return
+                        await send_long_code(update, compute_fourier_series(expr_str, period))
+                        return
+
+            elif is_conv(q_lower):
+                e1, e2 = _parse_two_signals(routed_command)
+                if e1 and e2:
+                    steps, err, plot_path = _build_convolution_steps(e1, e2, msg_id)
+                    if not err:
+                        png = _render_math_png("🔁 Convolution (f ★ g)(t)", steps, msg_id)
+                        if png and os.path.exists(png):
+                            await update.message.reply_photo(
+                                photo=open(png, "rb"),
+                                caption=f"Convolution: f(t)={e1} ★ g(t)={e2}")
+                        if plot_path and os.path.exists(plot_path):
+                            await update.message.reply_photo(
+                                photo=open(plot_path, "rb"),
+                                caption="📊 Numerical convolution (f ★ g)(t)")
+                        return
+
+            elif is_plot(q_lower):
+                fig_path = generate_plot(routed_command, msg_id)
+                if fig_path and os.path.exists(fig_path):
+                    await update.message.reply_photo(
+                        photo=open(fig_path, "rb"), caption=f"📈 {routed_command}")
+                    return
+
+            # If routing matched but math pipeline failed, fall through to LLM
+            if qa_chain:
+                await update.message.reply_text("🤔 Solving with tutor…")
+                try:
+                    answer = qa_chain.invoke(extracted)
+                    await send_long(update, answer)
+                except Exception as e:
+                    await update.message.reply_text(f"❌ Something went wrong: {str(e)}")
+            else:
+                await update.message.reply_text(
+                    "⚠️ No knowledge base loaded. Try adding a caption with your question.")
+
         else:
-            session_store(chat_id, extracted, "Handwritten photo / diagram")
-            await update.message.reply_text(
-                "Photo loaded. What would you like me to do?\n"
-                "  • _Solve this_\n"
-                "  • _Explain step by step_\n"
-                "  • _What is this question asking?_\n"
-                "  • _Describe this diagram_")
+            # No math pattern found — handle as handwritten work / diagram
+            if sess:
+                context.user_data["pending_student_work"] = extracted
+                await update.message.reply_text(
+                    f"I have *{sess['source']}* loaded as your memo/reference.\n\n"
+                    "Reply *mark* to compare your work against it, or tell me what "
+                    "else you'd like me to do.",
+                    parse_mode="Markdown")
+            else:
+                session_store(chat_id, extracted, "Handwritten photo / diagram")
+                await update.message.reply_text(
+                    "Photo loaded. What would you like me to do?\n"
+                    "  • _Solve this_\n"
+                    "  • _Explain step by step_\n"
+                    "  • _What is this question asking?_\n"
+                    "  • _Describe this diagram_")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1830,9 +2067,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Content loaded from *{source}*.\n\n"
         f"Preview: _{preview}…_\n\n"
         f"Now tell me what you'd like me to do:\n"
-        f"  • _Solve question 3_\n"
-        f"  • _Mark my work against this memo_\n"
-        f"  • _Explain what this question is asking_",
+        f"  • _Explain how Question 1(b) was solved_\n"
+        f"  • _Answer Question 2(a)_\n"
+        f"  • _Give me two practice problems like Question 3_\n"
+        f"  • _Mark my work against this memo_",
         parse_mode="Markdown")
 
     if caption:
