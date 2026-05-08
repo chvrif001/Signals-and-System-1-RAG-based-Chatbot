@@ -202,22 +202,18 @@ def extract_expr(question: str) -> str | None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LATEX MATH RENDERER
+# LATEX / MATHTEXT SANITISER  (shared by math PNGs and response renderer)
 # ══════════════════════════════════════════════════════════════════════════════
-
-def _sympy_to_latex(expr: sp.Expr) -> str:
-    return sp.latex(expr)
-
 
 def _sanitise_mathtext(s: str) -> str:
     s = re.sub(r'\\theta\\left\(([^)]+)\\right\)', r'u(\1)', s)
     s = s.replace(r'\theta\left(t\right)', r'u(t)')
-    s = re.sub(r'(?<![a-zA-Z\\])i(?![a-zA-Z0-9{])', r'j', s)
-    s = re.sub(r'\\mathcal\{([^}]+)\}',  r'\\mathbf{\1}', s)
-    s = re.sub(r'\\mathscr\{([^}]+)\}',  r'\\mathbf{\1}', s)
-    s = re.sub(r'\\mathrm\{([^}]+)\}',   r'\\rm \1',      s)
-    s = re.sub(r'\\operatorname\{([^}]+)\}', r'\\rm \1',  s)
-    s = re.sub(r'\\text\{([^}]*)\}',     r'\\rm \1',      s)
+    s = re.sub(r'(?<![a-zA-Z\\])i(?![a-zA-Z0-9{\\])', 'j', s)
+    s = re.sub(r'\\mathcal\{([^}]+)\}',     r'\\mathbf{\1}', s)
+    s = re.sub(r'\\mathscr\{([^}]+)\}',     r'\\mathbf{\1}', s)
+    s = re.sub(r'\\mathrm\{([^}]+)\}',      r'\\rm \1',      s)
+    s = re.sub(r'\\operatorname\{([^}]+)\}', r'\\rm \1',     s)
+    s = re.sub(r'\\text\{([^}]*)\}',        r'\\rm \1',      s)
     s = s.replace(r'\qquad', r'\ \ \ \ ')
     s = s.replace(r'\quad',  r'\ \ ')
     s = s.replace(r'\,',     r'\ ')
@@ -225,6 +221,14 @@ def _sanitise_mathtext(s: str) -> str:
     s = re.sub(r'\\left\s*',  '', s)
     s = re.sub(r'\\right\s*', '', s)
     return s
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LATEX MATH RENDERER  (used by transform / convolution step cards)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _sympy_to_latex(expr: sp.Expr) -> str:
+    return sp.latex(expr)
 
 
 def _try_render_row(ax, x_label: float, x_expr: float, y: float,
@@ -295,6 +299,175 @@ def _render_math_png(title: str, steps: list[tuple[str, str]], msg_id: int) -> s
         import traceback; traceback.print_exc()
         plt.close("all")
         return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LLM RESPONSE RENDERER  (prose + inline math → PNG)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_PLAIN_TO_MATHTEXT = [
+    (r'\bω\b',  r'\\omega'),
+    (r'\bΩ\b',  r'\\Omega'),
+    (r'\bπ\b',  r'\\pi'),
+    (r'\bδ\b',  r'\\delta'),
+    (r'\bτ\b',  r'\\tau'),
+    (r'\bα\b',  r'\\alpha'),
+    (r'\bβ\b',  r'\\beta'),
+    (r'\bσ\b',  r'\\sigma'),
+    (r'\^(-?[\w/]+)',    r'^{\1}'),
+    (r'e\^\{([^}]+)\}', r'e^{\1}'),
+    (r'\bsinc\b',        r'\\mathrm{sinc}'),
+]
+
+_EQ_LINE_RE = re.compile(
+    r'^.*(?:'
+    r'[A-Za-zΩωπδτ]\([^)]*\)\s*='
+    r'|=\s*\\frac'
+    r'|\\int'
+    r'|[∫∑∏]'
+    r'|(?:\^|_)\{[^}]+\}'
+    r').*$',
+    re.IGNORECASE
+)
+
+
+def _plain_to_mt(expr: str) -> str:
+    for pat, rep in _PLAIN_TO_MATHTEXT:
+        expr = re.sub(pat, rep, expr)
+    return expr
+
+
+def _extract_math_blocks(text: str) -> list[tuple[str, str]]:
+    """Split text on $...$ / $$...$$ delimiters."""
+    segments = []
+    parts = re.split(r'(\$\$[\s\S]+?\$\$|\$[^$\n]+?\$)', text)
+    for part in parts:
+        if part.startswith('$$') and part.endswith('$$'):
+            segments.append(('math', part[2:-2].strip()))
+        elif part.startswith('$') and part.endswith('$'):
+            segments.append(('math', part[1:-1].strip()))
+        else:
+            segments.append(('prose', part))
+    return segments
+
+
+def _split_prose_lines(prose: str) -> list[tuple[str, str]]:
+    """Tag equation-looking lines inside a prose block as 'math'."""
+    out = []
+    for line in prose.split('\n'):
+        stripped = line.strip()
+        if _EQ_LINE_RE.match(stripped) and len(stripped) > 5:
+            out.append(('math', _plain_to_mt(stripped)))
+        else:
+            out.append(('prose', line))
+    return out
+
+
+def render_response_png(llm_text: str, title: str, msg_id: int) -> str | None:
+    """
+    Render a full LLM text response as a PNG image.
+    $...$ / $$...$$ blocks → blue mathtext.
+    Equation-looking plain lines → promoted to mathtext automatically.
+    Prose lines rendered as clean text with bold step headings.
+    """
+    rows: list[tuple[str, str]] = []
+    for kind, content in _extract_math_blocks(llm_text):
+        if kind == 'math':
+            rows.append(('math', content))
+        else:
+            rows.extend(_split_prose_lines(content))
+
+    # Trim blank edges
+    while rows and rows[0][1].strip() == '':
+        rows.pop(0)
+    while rows and rows[-1][1].strip() == '':
+        rows.pop()
+
+    if not rows:
+        return None
+
+    FIG_W     = 13.0
+    PROSE_FS  = 13
+    MATH_FS   = 15
+    LINE_H    = 0.38   # inches per prose line
+    MATH_H    = 0.55   # inches per math line
+    TITLE_H   = 0.65
+    PAD       = 0.4
+
+    total_h = TITLE_H + PAD
+    for kind, _ in rows:
+        total_h += MATH_H if kind == 'math' else LINE_H
+    total_h = max(4.0, total_h)
+
+    fig, ax = plt.subplots(figsize=(FIG_W, total_h), facecolor='white')
+    ax.set_facecolor('white')
+    ax.axis('off')
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, total_h)
+
+    # Title
+    y = total_h - 0.15
+    ax.text(0.5, y, title,
+            fontsize=16, fontweight='bold', color='#1a1a2e',
+            ha='center', va='top', usetex=False)
+    y -= TITLE_H
+    ax.plot([0.02, 0.98], [y + 0.08, y + 0.08],
+            color='#cccccc', linewidth=1.0)
+
+    INDENT      = 0.03
+    MATH_INDENT = 0.06
+
+    for kind, txt in rows:
+        if not txt.strip():
+            y -= LINE_H * 0.45
+            continue
+
+        if kind == 'math':
+            safe = _sanitise_mathtext(txt)
+            try:
+                ax.text(MATH_INDENT, y, f'${safe}$',
+                        fontsize=MATH_FS, color='#003388',
+                        va='top', ha='left', usetex=False)
+            except Exception:
+                ax.text(MATH_INDENT, y, txt,
+                        fontsize=MATH_FS - 2, color='#444444',
+                        va='top', ha='left', fontfamily='monospace', usetex=False)
+            y -= MATH_H
+        else:
+            # Strip markdown bold/italic markers
+            display = re.sub(r'\*\*?([^*]+)\*\*?', r'\1', txt)
+            display = re.sub(r'__?([^_]+)__?',      r'\1', display)
+            is_heading = bool(re.match(r'\*\*', txt) or re.match(r'Step\s+\d+', txt.strip()))
+            ax.text(INDENT, y, display,
+                    fontsize=PROSE_FS,
+                    color='#1a1a2e' if is_heading else '#222222',
+                    fontweight='bold' if is_heading else 'normal',
+                    va='top', ha='left', usetex=False)
+            y -= LINE_H
+
+    fig.tight_layout(pad=0.3)
+    path = os.path.join(PLOT_FOLDER, f'response_{msg_id}.png')
+    fig.savefig(path, dpi=160, bbox_inches='tight',
+                facecolor='white', edgecolor='none')
+    plt.close('all')
+    return path
+
+
+async def send_llm_response(update: Update, response_text: str,
+                             title: str, msg_id: int) -> None:
+    """
+    Send an LLM response as a rendered PNG.
+    Falls back to chunked plain text if rendering fails.
+    """
+    png = render_response_png(response_text, title, msg_id)
+    if png and os.path.exists(png):
+        await update.message.reply_photo(
+            photo=open(png, 'rb'),
+            caption=title[:1024]
+        )
+    else:
+        for i in range(0, len(response_text), 4096):
+            await update.message.reply_text(response_text[i:i + 4096])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -372,21 +545,13 @@ def _build_fourier_steps(expr_str: str) -> tuple[list[tuple[str, str]], str]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PERIODIC SUMMATION FOURIER STEP BUILDER  ← NEW
+# PERIODIC SUMMATION FOURIER STEP BUILDER
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _build_periodic_fourier_steps(
     g_expr_str: str,
     period: float = 2.0,
 ) -> tuple[list[tuple[str, str]], str]:
-    """
-    Build step-by-step LaTeX rows for:
-        x(t) = Σ_{k=-∞}^{∞} g(t − k·T)
-
-    Uses the Poisson Summation / periodic-repetition property:
-        X(ω) = ω₀ Σ_{n=-∞}^{∞} G(n·ω₀) · δ(ω − n·ω₀)
-    where G(ω) = F{g(t)}.
-    """
     steps: list[tuple[str, str]] = []
     try:
         g      = parse_ct_expr(g_expr_str)
@@ -395,35 +560,27 @@ def _build_periodic_fourier_steps(
         w0     = 2 * sp.pi / T_sym
         w0_tex = _sympy_to_latex(w0)
 
-        # Step 1: State the signal
         steps.append((
             "Signal",
             rf"x(t) = \sum_{{k=-\infty}}^{{\infty}} g(t - {_sympy_to_latex(T_sym)}k)"
             rf",\quad g(t) = {g_tex}"
         ))
-
-        # Step 2: Periodic repetition property
         steps.append((
             "Property",
             rf"x(t)=\sum_k g(t-kT) \;\xrightarrow{{\mathcal{{F}}}}\;"
             rf"X(\omega)=\omega_0\sum_{{n=-\infty}}^{{\infty}}"
             rf"G(n\omega_0)\,\delta(\omega-n\omega_0)"
         ))
-
-        # Step 3: Fundamental frequency
         steps.append((
             "Fund. freq.",
             rf"\omega_0 = \frac{{2\pi}}{{T}} = \frac{{2\pi}}{{{_sympy_to_latex(T_sym)}}} "
             rf"= {w0_tex}\ \mathrm{{rad/s}}"
         ))
-
-        # Step 4: Definition of G(ω)
         steps.append((
             "Definition",
             r"G(\omega) = \int_{-\infty}^{\infty} g(t)\,e^{-j\omega t}\,dt"
         ))
 
-        # Step 5: Compute G(ω)
         try:
             G_result = _fourier_direct(g)
             G_tex    = _sympy_to_latex(G_result)
@@ -435,20 +592,16 @@ def _build_periodic_fourier_steps(
                 rf"G(\omega) = \int_{{-\infty}}^{{\infty}} {g_tex}\,e^{{-j\omega t}}\,dt"
             ))
 
-        # Step 6: Substitute into summation
         steps.append((
             "Substitute",
             rf"X(\omega) = {w0_tex}\sum_{{n=-\infty}}^{{\infty}}"
             rf"G(n\cdot {w0_tex})\,\delta(\omega - n\cdot {w0_tex})"
         ))
-
-        # Step 7: Final result
         steps.append((
             "Result",
             rf"X(\omega) = \omega_0\sum_{{n=-\infty}}^{{\infty}}"
             rf"G(n\omega_0)\,\delta(\omega-n\omega_0)"
         ))
-
         steps.append((
             "Note",
             rf"\text{{Discrete spectral lines at multiples of }}"
@@ -456,7 +609,6 @@ def _build_periodic_fourier_steps(
         ))
 
         return steps, ""
-
     except Exception as e:
         return [], f"❌ Could not compute periodic Fourier transform: {e}"
 
@@ -1060,7 +1212,6 @@ FOURIER_KEYS = ["fourier transform", "ft{", "fourier of", "f transform",
 FS_KEYS      = ["fourier series", "periodic signal", "series of"]
 CONV_KEYS    = ["convolution", "convolve", "f*g", "f★g", "f star g"]
 
-# ── NEW: periodic summation keywords ──────────────────────────────────────────
 PERIODIC_FOURIER_KEYS = [
     "sum", "summation", "periodic summation", "x(t) =", "x(t)=",
     "k=-inf", "k = -inf", "g(t-2k)", "g(t -", "poisson",
@@ -1075,7 +1226,6 @@ def is_plot(q: str)    -> bool:          return any(k in q for k in PLOT_KEYWORD
 
 
 def is_periodic_fourier(q: str) -> bool:
-    """True when query mentions Fourier AND a periodic summation structure."""
     has_fourier   = any(k in q for k in FOURIER_KEYS)
     has_summation = any(k in q for k in PERIODIC_FOURIER_KEYS)
     return has_fourier and has_summation
@@ -1268,7 +1418,7 @@ def _extract_pdf_bytes(pdf_bytes: bytes) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DOCUMENT PARSER — Feature 3
+# DOCUMENT PARSER
 # ══════════════════════════════════════════════════════════════════════════════
 _Q_MAIN = re.compile(
     r'(?:^|\n)\s*(?:Question|Q\.?)\s*(\d+)\b[^\n]*',
@@ -1370,13 +1520,12 @@ def extract_question_with_context(doc_text: str, instruction: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# AUTO-ROUTE OCR OUTPUT — Feature 4
+# AUTO-ROUTE OCR OUTPUT
 # ══════════════════════════════════════════════════════════════════════════════
 
 def auto_route_extracted_text(extracted: str) -> str | None:
     lower = extracted.lower()
 
-    # ── Periodic summation Fourier (must check BEFORE generic Fourier) ────────
     if re.search(r'sum.*g\s*\(t', lower) and "fourier" in lower:
         g_def = re.search(r'g\s*\(\s*t\s*\)\s*=\s*([^\n,]+)', lower)
         T_def = re.search(r'[Tt]\s*=\s*([\d\.]+)', lower)
@@ -1387,7 +1536,6 @@ def auto_route_extracted_text(extracted: str) -> str | None:
             f"g(t) = {g_part}, T={T_part}"
         )
 
-    # ── Laplace ───────────────────────────────────────────────────────────────
     m_lap = re.search(
         r'(?:find|compute|determine|calculate)?\s*'
         r'(?:the\s+)?laplace\s+(?:transform\s+)?(?:of\s+)?(.+)',
@@ -1397,7 +1545,6 @@ def auto_route_extracted_text(extracted: str) -> str | None:
         expr = m_lap.group(1).strip().split('\n')[0].strip(' .')
         return f"laplace of {expr}"
 
-    # ── Inverse Laplace ───────────────────────────────────────────────────────
     m_ilap = re.search(
         r'inverse\s+laplace\s+(?:transform\s+)?(?:of\s+)?(.+)',
         lower, re.IGNORECASE | re.DOTALL
@@ -1406,7 +1553,6 @@ def auto_route_extracted_text(extracted: str) -> str | None:
         expr = m_ilap.group(1).strip().split('\n')[0].strip(' .')
         return f"inverse laplace of {expr}"
 
-    # ── Fourier Transform ─────────────────────────────────────────────────────
     m_ft = re.search(
         r'(?:find|compute|determine|calculate)?\s*'
         r'(?:the\s+)?fourier\s+transform\s+(?:of\s+)?(.+)',
@@ -1416,7 +1562,6 @@ def auto_route_extracted_text(extracted: str) -> str | None:
         expr = m_ft.group(1).strip().split('\n')[0].strip(' .')
         return f"fourier transform of {expr}"
 
-    # ── Fourier Series ────────────────────────────────────────────────────────
     m_fs = re.search(
         r'fourier\s+series\s+(?:of\s+)?(.+)',
         lower, re.IGNORECASE | re.DOTALL
@@ -1425,7 +1570,6 @@ def auto_route_extracted_text(extracted: str) -> str | None:
         expr = m_fs.group(1).strip().split('\n')[0].strip(' .')
         return f"fourier series of {expr}"
 
-    # ── Convolution ───────────────────────────────────────────────────────────
     m_conv = re.search(
         r'(?:find|compute|determine)?\s*(?:the\s+)?convolution\s+(?:of\s+)?(.+)',
         lower, re.IGNORECASE | re.DOTALL
@@ -1434,7 +1578,6 @@ def auto_route_extracted_text(extracted: str) -> str | None:
         expr = m_conv.group(1).strip().split('\n')[0].strip(' .')
         return f"convolve {expr}"
 
-    # ── Plot request ──────────────────────────────────────────────────────────
     m_plot = re.search(
         r'(?:sketch|plot|draw|graph)\s+(?:the\s+signal\s+)?(.+)',
         lower, re.IGNORECASE | re.DOTALL
@@ -1447,16 +1590,26 @@ def auto_route_extracted_text(extracted: str) -> str | None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SESSION-AWARE LLM CALLS
+# SESSION-AWARE LLM PROMPTS
 # ══════════════════════════════════════════════════════════════════════════════
-_SESSION_RULES = """IMPORTANT — follow strictly:
+
+_LATEX_INSTRUCTION = (
+    "FORMATTING RULE: Wrap ALL mathematical expressions, equations, and formulas "
+    "using LaTeX notation: $...$ for inline math and $$...$$ for display/standalone equations. "
+    "For example, write $G(\\omega) = \\frac{1}{a + j\\omega}$ not G(omega) = 1/(a+jw). "
+    "Use standard LaTeX commands: \\frac{}{}, \\int, \\sum, \\omega, \\delta, \\pi, "
+    "\\mathcal{L}, \\mathcal{F}, e^{-st}, etc."
+)
+
+_SESSION_RULES = f"""IMPORTANT — follow strictly:
 1. The uploaded document is the PRIMARY and authoritative source of truth.
 2. Use your general Signals & Systems knowledge ONLY to explain or clarify —
    never to contradict, override, or replace the uploaded content.
 3. For correctness, marking, and solution verification rely exclusively on
    the uploaded document.
 4. If OCR output looks garbled in a critical spot, say so and give your best
-   interpretation — do not silently substitute your own answer."""
+   interpretation — do not silently substitute your own answer.
+5. {_LATEX_INSTRUCTION}"""
 
 
 def _prompt_explain_memo(doc_text: str, instruction: str) -> str:
@@ -1475,7 +1628,8 @@ def _prompt_explain_memo(doc_text: str, instruction: str) -> str:
         f"different signal parameters. For each, state the problem clearly, then provide "
         f"the worked solution.\n"
         f"5. End with one short study tip specific to this technique.\n"
-        f"Be concise but thorough. Use numbered steps."
+        f"Be concise but thorough. Use numbered steps. "
+        f"Wrap all math in $...$ or $$...$$."
     )
 
 
@@ -1498,7 +1652,8 @@ def _prompt_mark(memo_text: str, student_work: str) -> str:
         f"referencing the memo solution.\n"
         f"6. ENCOURAGEMENT: End with one specific, genuine encouragement statement "
         f"based on what the student demonstrated.\n"
-        f"Format each section clearly with its heading."
+        f"Format each section clearly with its heading. "
+        f"Wrap all math in $...$ or $$...$$."
     )
 
 
@@ -1508,7 +1663,8 @@ def _prompt_solve(doc_text: str, instruction: str) -> str:
         f"Uploaded document:\n\"\"\"\n{doc_text}\n\"\"\"\n\n"
         f"Student instruction: {instruction}\n\n"
         f"Respond directly. Use numbered steps where maths is involved. "
-        f"Explain every formula and symbol."
+        f"Explain every formula and symbol. "
+        f"Wrap all math in $...$ or $$...$$."
     )
 
 
@@ -1521,7 +1677,8 @@ def _prompt_explain(doc_text: str, question: str) -> str:
         f"  FACTUAL     → 2–4 sentences.\n"
         f"  CONCEPTUAL  → short paragraph + one example.\n"
         f"  CALCULATION → numbered steps, explain every symbol.\n"
-        f"Answer based on the uploaded document. Use general knowledge only to aid clarity."
+        f"Answer based on the uploaded document. Use general knowledge only to aid clarity. "
+        f"Wrap all math in $...$ or $$...$$."
     )
 
 
@@ -1615,6 +1772,7 @@ def build_vector_store_if_needed(pdf_folder: str, chroma_dir: str):
 # ══════════════════════════════════════════════════════════════════════════════
 TUTOR_PROMPT = PromptTemplate.from_template(
     "You are a Signals and Systems tutor assistant.\n\n"
+    f"{_LATEX_INSTRUCTION}\n\n"
     "First, silently classify the student's question into one of three types:\n"
     "  A) FACTUAL — asking for course info, dates, definitions, or simple facts\n"
     "  B) CONCEPTUAL — asking to understand an idea, theorem, or technique\n"
@@ -1771,7 +1929,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"⏳ Marking against *{sess['source']}*…", parse_mode="Markdown")
             prompt   = _prompt_mark(sess["text"], pending_work)
             response = _call_llm(prompt)
-            await send_long(update, response)
+            title    = f"Marking Feedback — {sess['source']}"
+            await send_llm_response(update, response, title, msg_id)
             session_clear(chat_id)
             await update.message.reply_text(
                 "_(Session cleared — uploaded file no longer in memory.)_",
@@ -1783,7 +1942,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown")
         prompt   = _route_session_prompt(sess["text"], question)
         response = _call_llm(prompt)
-        await send_long(update, response)
+        title    = f"Answer — {sess['source']}"
+        await send_llm_response(update, response, title, msg_id)
         session_clear(chat_id)
         await update.message.reply_text(
             "_(Session cleared — uploaded file no longer in memory.)_",
@@ -1792,11 +1952,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── 3. Math tools ─────────────────────────────────────────────────────────
 
-    # ── Periodic summation Fourier (must be checked BEFORE generic Fourier) ───
+    # ── Periodic summation Fourier ────────────────────────────────────────────
     if is_periodic_fourier(q_lower):
         period_val = _extract_period(question) or 2.0
 
-        # Try to get g(t) from session document first, then from question text
         sess  = session_get(chat_id)
         g_str = None
 
@@ -1984,7 +2143,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🤔 Thinking…")
     try:
         answer = qa_chain.invoke(question)
-        await send_long(update, answer)
+        await send_llm_response(update, answer, "Tutor Answer", msg_id)
     except Exception as e:
         await update.message.reply_text(f"❌ Something went wrong: {str(e)}")
 
@@ -2019,7 +2178,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"⏳ Marking against *{sess['source']}*…", parse_mode="Markdown")
             prompt   = _prompt_mark(sess["text"], extracted)
             response = _call_llm(prompt)
-            await send_long(update, response)
+            await send_llm_response(update, response,
+                                    f"Marking Feedback — {sess['source']}", msg_id)
             session_clear(chat_id)
             await update.message.reply_text(
                 "_(Session cleared — uploaded file no longer in memory.)_",
@@ -2032,14 +2192,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown")
             prompt   = _route_session_prompt(doc_text, caption)
             response = _call_llm(prompt)
-            await send_long(update, response)
+            await send_llm_response(update, response, f"Answer — {source}", msg_id)
             if sess:
                 session_clear(chat_id)
                 await update.message.reply_text(
                     "_(Session cleared — uploaded file no longer in memory.)_",
                     parse_mode="Markdown")
     else:
-        # ── Feature 4: No caption — auto-route OCR output ─────────────────────
         routed_command = auto_route_extracted_text(extracted)
 
         if routed_command:
@@ -2049,7 +2208,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             q_lower = routed_command.lower()
 
-            # ── Periodic summation (checked first) ────────────────────────────
             if is_periodic_fourier(q_lower):
                 period_val = _extract_period(routed_command) or 2.0
                 g_def_r    = re.search(
@@ -2140,12 +2298,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         photo=open(fig_path, "rb"), caption=f"📈 {routed_command}")
                     return
 
-            # Routing matched but math pipeline failed — fall through to LLM
+            # Math pipeline failed — fall back to LLM
             if qa_chain:
                 await update.message.reply_text("🤔 Solving with tutor…")
                 try:
                     answer = qa_chain.invoke(extracted)
-                    await send_long(update, answer)
+                    await send_llm_response(update, answer, "Tutor Answer", msg_id)
                 except Exception as e:
                     await update.message.reply_text(f"❌ Something went wrong: {str(e)}")
             else:
@@ -2153,7 +2311,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "⚠️ No knowledge base loaded. Try adding a caption with your question.")
 
         else:
-            # No math pattern found
             if sess:
                 context.user_data["pending_student_work"] = extracted
                 await update.message.reply_text(
@@ -2230,7 +2387,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏳ Also acting on your caption: _{caption}_…",
             parse_mode="Markdown")
         response = _call_llm(prompt)
-        await send_long(update, response)
+        await send_llm_response(update, response, f"Answer — {source}", msg_id=update.message.message_id)
         session_clear(chat_id)
         await update.message.reply_text(
             "_(Session cleared — uploaded file no longer in memory.)_",
