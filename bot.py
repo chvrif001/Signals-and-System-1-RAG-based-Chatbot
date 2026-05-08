@@ -634,11 +634,6 @@ def _build_laplace_steps(expr_str: str) -> tuple[list[tuple[str, str]], str]:
         result_tex = _sympy_to_latex(result)
         steps.append(("Result", rf"F(s) = {result_tex}"))
 
-        if "exp" in str(f):
-            steps.append(("ROC", r"\mathrm{Re}(s) > -a"))
-        elif "Heaviside" in str(f):
-            steps.append(("ROC", r"\mathrm{Re}(s) > 0"))
-
         return steps, ""
     except Exception as e:
         return [], f"❌ Could not compute Laplace transform: {e}"
@@ -663,11 +658,6 @@ def _build_fourier_steps(expr_str: str) -> tuple[list[tuple[str, str]], str]:
         result_tex = _sympy_to_latex(result).replace(r"\mathbf{i}", "j").replace(" i ", " j ").replace("{i}", "{j}")
         result_tex = re.sub(r'(?<![a-zA-Z])i(?![a-zA-Z])', 'j', result_tex)
         steps.append(("Result", rf"F(\omega) = {result_tex}"))
-
-        if "Heaviside" in str(f) and "exp" in str(f):
-            steps.append(("Note", r"|F(\omega)| \text{ is low-pass, decays as } 1/\omega"))
-        elif "cos" in str(f) or "sin" in str(f):
-            steps.append(("Note", r"\text{Spectrum = discrete Dirac lines}"))
 
         return steps, ""
     except Exception as e:
@@ -854,12 +844,10 @@ def _build_convolution_steps(expr1_str: str, expr2_str: str,
         limits = (tau, lower, upper)
         lower_tex = _sympy_to_latex(lower)
         upper_tex = _sympy_to_latex(upper)
-        steps.append(("Limits",
-                       rf"\tau \in [{lower_tex},\; {upper_tex}] "
-                       rf"\text{{ (from Heaviside support)}}"))
+      
     else:
         limits = (tau, -sp.oo, sp.oo)
-        steps.append(("Limits", r"\tau \in (-\infty, \infty)"))
+       
 
     try:
         result = sp.integrate(integrand, limits)
@@ -2502,7 +2490,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"📄 Received *{file_name}* — extracting content…\n"
-        f"_(This file is used for this session only and will not be saved permanently.)_",
         parse_mode="Markdown")
 
     tg_file = await doc.get_file()
@@ -2525,10 +2512,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     session_store(chat_id, extracted, source)
 
-    preview = extracted[:300].replace("\n", " ")
     await update.message.reply_text(
         f"✅ Content loaded from *{source}*.\n\n"
-        f"Preview: _{preview}…_\n\n"
         f"Now tell me what you'd like me to do:\n"
         f"  - Explain how Question 1(b) was solved\n"
         f"  - Answer Question 2(a)\n"
