@@ -26,7 +26,8 @@ from sentence_transformers import SentenceTransformer
 
 from telegram import Update
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, filters, ContextTypes
+    Application, ApplicationBuilder, CommandHandler,
+    MessageHandler, filters, ContextTypes
 )
 
 nest_asyncio.apply()
@@ -89,20 +90,31 @@ a_sym = sp.Symbol("a",     positive=True)
 # ══════════════════════════════════════════════════════════════════════════════
 # SIGNAL PARSER
 # ══════════════════════════════════════════════════════════════════════════════
+def _rect(x):
+    """SymPy rect (rectangular window) function."""
+    return sp.Piecewise(
+        (sp.Integer(1),      sp.Abs(x) < sp.Rational(1, 2)),
+        (sp.Rational(1, 2),  sp.Eq(sp.Abs(x), sp.Rational(1, 2))),
+        (sp.Integer(0),      True)
+    )
+
+
 def _normalise(expr: str) -> str:
     s = expr.strip()
     s = s.replace("^", "**").replace("{", "(").replace("}", ")")
-    s = re.sub(r'\bu\s*\(\s*t\s*\)', 'Heaviside(t)', s)
-    s = re.sub(r'\bu\s*\(\s*t\s*([+-][^)]+)\)', r'Heaviside(t\1)', s)
-    s = re.sub(r'\bE\*\*(-[^\s\*\+\-\(\),]+)', r'E**(\1)', s)
-    s = re.sub(r'\be\*\*(-[^\s\*\+\-\(\),]+)', r'E**(\1)', s)
-    s = re.sub(r'(\d)(t\b)',               r'\1*\2', s)
-    s = re.sub(r'(\d)(sin|cos|exp|sqrt)',  r'\1*\2', s)
-    s = re.sub(r'(\d)\s*[eE]\*\*',        r'\1*E**', s)
-    s = re.sub(r'\be\b', 'E', s)
-    s = re.sub(r'\bu\s*[\(\[]', 'Heaviside(', s)
-    s = re.sub(r'\]', ')', s)
-    s = re.sub(r'\b(?:delta|δ)\s*[\(\[]', 'DiracDelta(', s)
+    # rect() — keep as-is for sympify with our custom namespace
+    s = re.sub(r'\brect\s*\(',                       'rect(',          s)
+    s = re.sub(r'\bu\s*\(\s*t\s*\)',                 'Heaviside(t)',   s)
+    s = re.sub(r'\bu\s*\(\s*t\s*([+-][^)]+)\)',      r'Heaviside(t\1)', s)
+    s = re.sub(r'\bE\*\*(-[^\s\*\+\-\(\),]+)',       r'E**(\1)',       s)
+    s = re.sub(r'\be\*\*(-[^\s\*\+\-\(\),]+)',       r'E**(\1)',       s)
+    s = re.sub(r'(\d)(t\b)',                          r'\1*\2',         s)
+    s = re.sub(r'(\d)(sin|cos|exp|sqrt|rect)',        r'\1*\2',         s)
+    s = re.sub(r'(\d)\s*[eE]\*\*',                   r'\1*E**',        s)
+    s = re.sub(r'\be\b',                              'E',              s)
+    s = re.sub(r'\bu\s*[\(\[]',                       'Heaviside(',     s)
+    s = re.sub(r'\]',                                 ')',               s)
+    s = re.sub(r'\b(?:delta|δ)\s*[\(\[]',            'DiracDelta(',    s)
     s = re.sub(
         r'\bsinc\(([^)]+)\)',
         lambda m: f'(sin(pi*({m.group(1)})))/(pi*({m.group(1)}))',
@@ -114,9 +126,11 @@ def _normalise(expr: str) -> str:
 _COMMON_NS = {
     "t": t_sym, "s": s_sym, "omega": w_sym, "n": n_sym,
     "pi": sp.pi, "E": sp.E, "j": sp.I,
-    "Heaviside": sp.Heaviside, "DiracDelta": sp.DiracDelta,
-    "exp": sp.exp, "sin": sp.sin, "cos": sp.cos,
+    "Heaviside":  sp.Heaviside,
+    "DiracDelta": sp.DiracDelta,
+    "exp":  sp.exp,  "sin": sp.sin, "cos": sp.cos,
     "sqrt": sp.sqrt, "Abs": sp.Abs, "log": sp.log,
+    "rect": _rect,
 }
 
 
@@ -128,7 +142,7 @@ def _normalise_dt(expr: str) -> str:
     s = expr.strip()
     s = s.replace("^", "**").replace("{", "(").replace("}", ")")
     s = re.sub(r'\be\b', 'E', s)
-    s = re.sub(r'\bu\s*\[([^\]]+)\]', r'UnitStep(\1)', s)
+    s = re.sub(r'\bu\s*\[([^\]]+)\]',     r'UnitStep(\1)', s)
     s = re.sub(r'\b(?:delta|δ)\s*\[([^\]]+)\]', r'KronDelta(\1)', s)
     s = re.sub(r'(\d)(n\b)', r'\1*\2', s)
     return s
@@ -163,7 +177,7 @@ def parse_dt_expr(text: str):
 
 _SIGNAL_CHARS = ['(', '[', 't', 'n', 'sin', 'cos', 'exp',
                  'delta', 'δ', '**', '*', '+', 'sqrt', 'log',
-                 'Heaviside', 'DiracDelta']
+                 'Heaviside', 'DiracDelta', 'rect']
 
 _QUESTION_PREFIX = re.compile(
     r'^(?:what\s+is\s+(?:the\s+)?|what\'s\s+(?:the\s+)?|find\s+(?:the\s+)?|'
@@ -203,11 +217,50 @@ def extract_expr(question: str) -> str | None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LATEX / MATHTEXT SANITISER  (FIX 1: full unicode → LaTeX mapping)
+# RESPONSE-MODE GATE
+# ══════════════════════════════════════════════════════════════════════════════
+
+_MATH_TITLE_KEYWORDS = (
+    "laplace",
+    "fourier",
+    "convolution",
+    "transform",
+    "series",
+    "plot",
+    "signal",
+    "derivation",
+    "calculation",
+    "equation",
+    "answer —",        # session-doc answers (may contain heavy maths)
+    "marking feedback",
+    "tutor answer",    # RAG answers that contain step-by-step maths
+)
+
+# These titles are ALWAYS plain text regardless of content
+_PLAIN_TEXT_TITLES = (
+    "tutor answer",
+)
+
+
+def _is_math_title(title: str) -> bool:
+    """
+    Return True only when the response title indicates mathematical content
+    that benefits from PNG rendering (transforms, convolutions, session docs).
+    Plain Q&A / concept explanations return False → plain text reply.
+    """
+    t = title.lower()
+    # Explicit plain-text overrides first
+    if any(kw in t for kw in _PLAIN_TEXT_TITLES):
+        return False
+    return any(kw in t for kw in _MATH_TITLE_KEYWORDS)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LATEX / MATHTEXT SANITISER
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _sanitise_mathtext(s: str) -> str:
-    # ── Unicode symbols → LaTeX commands (MUST happen first) ──────────────────
+    # ── Unicode symbols → LaTeX commands ──────────────────────────────────────
     s = s.replace('∞', r'\infty')
     s = s.replace('∑', r'\sum')
     s = s.replace('∫', r'\int')
@@ -287,11 +340,11 @@ def _try_render_row(ax, x_label: float, x_expr: float, y: float,
 def _render_math_png(title: str, steps: list[tuple[str, str]], msg_id: int) -> str | None:
     try:
         n       = len(steps)
-        FONT    = 22           # bumped from 20
-        ROW_IN  = 0.95         # bumped from 0.80
-        PAD_IN  = 1.6          # bumped from 1.4
+        FONT    = 22
+        ROW_IN  = 0.95
+        PAD_IN  = 1.6
         fig_h   = max(4.0, n * ROW_IN + PAD_IN)
-        fig_w   = 16.0         # bumped from 12.0
+        fig_w   = 16.0
 
         fig, ax = plt.subplots(figsize=(fig_w, fig_h), facecolor="white")
         ax.set_facecolor("white")
@@ -333,7 +386,7 @@ def _render_math_png(title: str, steps: list[tuple[str, str]], msg_id: int) -> s
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LLM RESPONSE RENDERER  (FIX 2: larger fonts, wider canvas, text wrapping)
+# LLM RESPONSE RENDERER
 # ══════════════════════════════════════════════════════════════════════════════
 
 _PLAIN_TO_MATHTEXT = [
@@ -350,7 +403,6 @@ _PLAIN_TO_MATHTEXT = [
     (r'\bsinc\b',        r'\\mathrm{sinc}'),
 ]
 
-# FIX 3: extended _EQ_LINE_RE to catch lines containing unicode ∞, ∑, ∫, ∏
 _EQ_LINE_RE = re.compile(
     r'^.*(?:'
     r'[A-Za-zΩωπδτ]\([^)]*\)\s*='
@@ -409,17 +461,15 @@ def render_response_png(llm_text: str, title: str, msg_id: int) -> str | None:
     if not rows:
         return None
 
-    # ── Layout constants (FIX 2: larger sizes) ────────────────────────────────
-    FIG_W     = 18.0       # was 13.0 — wider canvas prevents text overflow
-    PROSE_FS  = 17         # was 13   — readable prose size
-    MATH_FS   = 22         # was 15   — prominent equations
-    LINE_H    = 0.55       # was 0.38 — more breathing room between lines
-    MATH_H    = 0.80       # was 0.55 — taller rows for equations
-    TITLE_H   = 0.85       # was 0.65
+    FIG_W     = 18.0
+    PROSE_FS  = 17
+    MATH_FS   = 22
+    LINE_H    = 0.55
+    MATH_H    = 0.80
+    TITLE_H   = 0.85
     PAD       = 0.5
 
-    # Pre-calculate figure height accounting for wrapped prose lines
-    WRAP_WIDTH = 115       # characters before wrapping prose
+    WRAP_WIDTH = 115
     total_h = TITLE_H + PAD
     for kind, txt in rows:
         if kind == 'math':
@@ -463,7 +513,6 @@ def render_response_png(llm_text: str, title: str, msg_id: int) -> str | None:
                         va='top', ha='left', fontfamily='monospace', usetex=False)
             y -= MATH_H
         else:
-            # Strip markdown bold/italic markers for display
             display = re.sub(r'\*\*?([^*]+)\*\*?', r'\1', txt)
             display = re.sub(r'__?([^_]+)__?',      r'\1', display)
             is_heading = bool(re.match(r'\*\*', txt) or re.match(r'Step\s+\d+', txt.strip())
@@ -471,7 +520,6 @@ def render_response_png(llm_text: str, title: str, msg_id: int) -> str | None:
                               or re.match(r'Why it', txt.strip())
                               or re.match(r'Study Tip', txt.strip()))
 
-            # Wrap long prose lines so they don't overflow the canvas
             if display.strip():
                 wrapped_lines = textwrap.wrap(display, width=WRAP_WIDTH)
                 if not wrapped_lines:
@@ -497,17 +545,59 @@ def render_response_png(llm_text: str, title: str, msg_id: int) -> str | None:
     return path
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# PHOTO SEND RETRY HELPER
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _send_photo_with_retry(update: Update, path: str, caption: str,
+                                  retries: int = 3, delay: float = 5.0) -> bool:
+    """
+    Try to send a photo up to `retries` times with exponential back-off.
+    Returns True on success, False if all attempts fail.
+    """
+    for attempt in range(1, retries + 1):
+        try:
+            with open(path, "rb") as f:
+                await update.message.reply_photo(
+                    photo=f,
+                    caption=caption[:1024]
+                )
+            return True
+        except Exception as exc:
+            print(f"[send_photo] attempt {attempt}/{retries} failed: {exc}")
+            if attempt < retries:
+                await asyncio.sleep(delay * attempt)   # 5 s, 10 s, …
+    return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEND LLM RESPONSE  (plain text by default; PNG only for maths/transforms)
+# ══════════════════════════════════════════════════════════════════════════════
+
 async def send_llm_response(update: Update, response_text: str,
-                             title: str, msg_id: int) -> None:
-    png = render_response_png(response_text, title, msg_id)
-    if png and os.path.exists(png):
-        await update.message.reply_photo(
-            photo=open(png, 'rb'),
-            caption=title[:1024]
-        )
-    else:
-        for i in range(0, len(response_text), 4096):
-            await update.message.reply_text(response_text[i:i + 4096])
+                             title: str, msg_id: int,
+                             force_image: bool = False) -> None:
+    """
+    Routing logic:
+      • force_image=True  OR  _is_math_title(title) → attempt PNG render
+      • otherwise → plain text reply_text (no image generated at all)
+
+    If PNG rendering is attempted but the photo send fails after retries,
+    the function falls back to plain text automatically.
+    """
+    if force_image or _is_math_title(title):
+        png = render_response_png(response_text, title, msg_id)
+        if png and os.path.exists(png):
+            success = await _send_photo_with_retry(update, png, title)
+            if success:
+                return
+            # All retries exhausted — fall through to plain text
+            print(f"[send_llm_response] photo send failed after retries, "
+                  f"falling back to plain text for title='{title}'")
+
+    # Plain-text path (default for general Q&A, and fallback for failed photos)
+    for i in range(0, len(response_text), 4096):
+        await update.message.reply_text(response_text[i:i + 4096])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -805,6 +895,8 @@ def _lambdify_ct(expr: sp.Expr):
         modules=["numpy", {
             "Heaviside":  lambda x: np.where(np.asarray(x, float) >= 0, 1., 0.),
             "DiracDelta": lambda x: np.zeros_like(np.asarray(x, float)),
+            "rect": lambda x: np.where(np.abs(x) < 0.5, 1.0,
+                              np.where(np.abs(x) == 0.5, 0.5, 0.0)),
         }]
     )
 
@@ -998,6 +1090,9 @@ def _identify_fourier_rule_latex(expr: sp.Expr) -> str:
         return r"\mathcal{F}\{\cos(\omega_0 t)\} = \pi[\delta(\omega+\omega_0)+\delta(\omega-\omega_0)]"
     if expr == sp.Integer(1):
         return r"\mathcal{F}\{1\} = 2\pi\delta(\omega)"
+    # rect-based pair
+    if "Piecewise" in str(expr):
+        return r"\mathcal{F}\{\mathrm{rect}(t/\tau)\} = \tau\,\mathrm{sinc}(\omega\tau/2)"
     return r"F(\omega) = \int_{-\infty}^{\infty} f(t)\,e^{-j\omega t}\,dt"
 
 
@@ -2046,29 +2141,27 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Fourier Transform  (Periodic Summation)", steps, msg_id
             )
             if png and os.path.exists(png):
-                await update.message.reply_photo(
-                    photo=open(png, "rb"),
-                    caption=(
-                        f"Fourier Transform of  x(t) = Σ g(t − {period_val}k)\n"
-                        f"where  g(t) = {g_str},  T = {period_val}"
-                    )
+                success = await _send_photo_with_retry(
+                    update, png,
+                    f"Fourier Transform of  x(t) = Σ g(t − {period_val}k)\n"
+                    f"where  g(t) = {g_str},  T = {period_val}"
                 )
-            else:
-                lines = [
-                    "📡 Fourier Transform — Periodic Summation\n",
-                    f"x(t) = Σ g(t − {period_val}k),   g(t) = {g_str}",
-                    f"T = {period_val},   ω₀ = 2π/{period_val} = "
-                    f"{2 * 3.14159 / period_val:.4g} rad/s\n",
-                    "Property:  X(ω) = ω₀ Σ G(nω₀) · δ(ω − nω₀)\n",
-                ]
-                try:
-                    g_sym = parse_ct_expr(g_str)
-                    G_sym = _fourier_direct(g_sym)
-                    lines.append(f"G(ω) = {sp.pretty(G_sym)}\n")
-                except Exception:
-                    lines.append("G(ω) = (see definition above)\n")
-                lines.append("✅  X(ω) = ω₀ Σ_n G(n·ω₀) · δ(ω − n·ω₀)")
-                await send_long_code(update, "\n".join(lines))
+                if not success:
+                    lines = [
+                        "📡 Fourier Transform — Periodic Summation\n",
+                        f"x(t) = Σ g(t − {period_val}k),   g(t) = {g_str}",
+                        f"T = {period_val},   ω₀ = 2π/{period_val} = "
+                        f"{2 * 3.14159 / period_val:.4g} rad/s\n",
+                        "Property:  X(ω) = ω₀ Σ G(nω₀) · δ(ω − nω₀)\n",
+                    ]
+                    try:
+                        g_sym = parse_ct_expr(g_str)
+                        G_sym = _fourier_direct(g_sym)
+                        lines.append(f"G(ω) = {sp.pretty(G_sym)}\n")
+                    except Exception:
+                        lines.append("G(ω) = (see definition above)\n")
+                    lines.append("✅  X(ω) = ω₀ Σ_n G(n·ω₀) · δ(ω − n·ω₀)")
+                    await send_long_code(update, "\n".join(lines))
         return
 
     # ── Laplace ───────────────────────────────────────────────────────────────
@@ -2086,9 +2179,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             png = _render_math_png("Laplace Transform", steps, msg_id)
             if png and os.path.exists(png):
-                await update.message.reply_photo(
-                    photo=open(png, "rb"),
-                    caption=f"Laplace Transform of  f(t) = {expr_str}")
+                success = await _send_photo_with_retry(
+                    update, png, f"Laplace Transform of  f(t) = {expr_str}")
+                if not success:
+                    await send_long_code(update, compute_laplace(expr_str))
             else:
                 await send_long_code(update, compute_laplace(expr_str))
         return
@@ -2108,9 +2202,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             png = _render_math_png("Fourier Transform", steps, msg_id)
             if png and os.path.exists(png):
-                await update.message.reply_photo(
-                    photo=open(png, "rb"),
-                    caption=f"Fourier Transform of  f(t) = {expr_str}")
+                success = await _send_photo_with_retry(
+                    update, png, f"Fourier Transform of  f(t) = {expr_str}")
+                if not success:
+                    await send_long_code(update, compute_fourier(expr_str))
             else:
                 await send_long_code(update, compute_fourier(expr_str))
         return
@@ -2135,9 +2230,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             png = _render_math_png("Fourier Series", steps, msg_id)
             if png and os.path.exists(png):
-                await update.message.reply_photo(
-                    photo=open(png, "rb"),
-                    caption=f"Fourier Series of  f(t) = {expr_str},  T = {period:.4g}")
+                success = await _send_photo_with_retry(
+                    update, png,
+                    f"Fourier Series of  f(t) = {expr_str},  T = {period:.4g}")
+                if not success:
+                    await send_long_code(update, compute_fourier_series(expr_str, period))
             else:
                 await send_long_code(update, compute_fourier_series(expr_str, period))
         return
@@ -2158,17 +2255,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             png = _render_math_png("Convolution  (f ★ g)(t)", steps, msg_id)
             if png and os.path.exists(png):
-                await update.message.reply_photo(
-                    photo=open(png, "rb"),
-                    caption=f"Convolution:  f(t)={e1}  ★  g(t)={e2}")
+                success = await _send_photo_with_retry(
+                    update, png, f"Convolution:  f(t)={e1}  ★  g(t)={e2}")
+                if not success:
+                    text_result, plot_path2 = compute_convolution(e1, e2, msg_id)
+                    await send_long_code(update, text_result)
+                    plot_path = plot_path or plot_path2
             else:
                 text_result, plot_path2 = compute_convolution(e1, e2, msg_id)
                 await send_long_code(update, text_result)
                 plot_path = plot_path or plot_path2
             if plot_path and os.path.exists(plot_path):
-                await update.message.reply_photo(
-                    photo=open(plot_path, "rb"),
-                    caption="📊 Numerical convolution  (f ★ g)(t)")
+                await _send_photo_with_retry(
+                    update, plot_path, "📊 Numerical convolution  (f ★ g)(t)")
         return
 
     # ── Plot ──────────────────────────────────────────────────────────────────
@@ -2176,8 +2275,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📊 Generating plot…")
         fig_path = generate_plot(question, msg_id)
         if fig_path and os.path.exists(fig_path):
-            await update.message.reply_photo(
-                photo=open(fig_path, "rb"), caption=f"📈 {question}")
+            success = await _send_photo_with_retry(update, fig_path, f"📈 {question}")
+            if not success:
+                await update.message.reply_text(
+                    "⚠️ Plot was generated but could not be sent. Please try again.")
         else:
             await update.message.reply_text(
                 "⚠️ Could not parse that expression.\n"
@@ -2194,6 +2295,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🤔 Thinking…")
     try:
         answer = qa_chain.invoke(question)
+        # General Q&A always returns plain text (title="Tutor Answer" → _is_math_title=False)
         await send_llm_response(update, answer, "Tutor Answer", msg_id)
     except Exception as e:
         await update.message.reply_text(f"❌ Something went wrong: {str(e)}")
@@ -2273,14 +2375,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             "Fourier Transform  (Periodic Summation)", steps, msg_id
                         )
                         if png and os.path.exists(png):
-                            await update.message.reply_photo(
-                                photo=open(png, "rb"),
-                                caption=(
-                                    f"Fourier Transform of  x(t) = Σ g(t − {period_val}k)\n"
-                                    f"where  g(t) = {g_str},  T = {period_val}"
-                                )
+                            success = await _send_photo_with_retry(
+                                update, png,
+                                f"Fourier Transform of  x(t) = Σ g(t − {period_val}k)\n"
+                                f"where  g(t) = {g_str},  T = {period_val}"
                             )
-                            return
+                            if success:
+                                return
 
             elif is_laplace(q_lower):
                 expr_str = extract_expr(routed_command)
@@ -2289,10 +2390,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if not err:
                         png = _render_math_png("Laplace Transform", steps, msg_id)
                         if png and os.path.exists(png):
-                            await update.message.reply_photo(
-                                photo=open(png, "rb"),
-                                caption=f"Laplace Transform of  f(t) = {expr_str}")
-                            return
+                            success = await _send_photo_with_retry(
+                                update, png,
+                                f"Laplace Transform of  f(t) = {expr_str}")
+                            if success:
+                                return
                     await send_long_code(update, compute_laplace(expr_str or routed_command))
                     return
 
@@ -2303,10 +2405,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if not err:
                         png = _render_math_png("Fourier Transform", steps, msg_id)
                         if png and os.path.exists(png):
-                            await update.message.reply_photo(
-                                photo=open(png, "rb"),
-                                caption=f"Fourier Transform of  f(t) = {expr_str}")
-                            return
+                            success = await _send_photo_with_retry(
+                                update, png,
+                                f"Fourier Transform of  f(t) = {expr_str}")
+                            if success:
+                                return
                     await send_long_code(update, compute_fourier(expr_str or routed_command))
                     return
 
@@ -2319,10 +2422,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         if not err:
                             png = _render_math_png("Fourier Series", steps, msg_id)
                             if png and os.path.exists(png):
-                                await update.message.reply_photo(
-                                    photo=open(png, "rb"),
-                                    caption=f"Fourier Series: f(t)={expr_str}, T={period:.4g}")
-                                return
+                                success = await _send_photo_with_retry(
+                                    update, png,
+                                    f"Fourier Series: f(t)={expr_str}, T={period:.4g}")
+                                if success:
+                                    return
                         await send_long_code(update, compute_fourier_series(expr_str, period))
                         return
 
@@ -2333,21 +2437,22 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if not err:
                         png = _render_math_png("Convolution (f ★ g)(t)", steps, msg_id)
                         if png and os.path.exists(png):
-                            await update.message.reply_photo(
-                                photo=open(png, "rb"),
-                                caption=f"Convolution: f(t)={e1} ★ g(t)={e2}")
+                            await _send_photo_with_retry(
+                                update, png,
+                                f"Convolution: f(t)={e1} ★ g(t)={e2}")
                         if plot_path and os.path.exists(plot_path):
-                            await update.message.reply_photo(
-                                photo=open(plot_path, "rb"),
-                                caption="📊 Numerical convolution (f ★ g)(t)")
+                            await _send_photo_with_retry(
+                                update, plot_path,
+                                "📊 Numerical convolution (f ★ g)(t)")
                         return
 
             elif is_plot(q_lower):
                 fig_path = generate_plot(routed_command, msg_id)
                 if fig_path and os.path.exists(fig_path):
-                    await update.message.reply_photo(
-                        photo=open(fig_path, "rb"), caption=f"📈 {routed_command}")
-                    return
+                    success = await _send_photo_with_retry(
+                        update, fig_path, f"📈 {routed_command}")
+                    if success:
+                        return
 
             # Math pipeline failed — fall back to LLM
             if qa_chain:
@@ -2447,10 +2552,17 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MAIN
+# MAIN  — HTTP/1.1 forced to avoid write-stall on photo uploads
 # ══════════════════════════════════════════════════════════════════════════════
 async def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .get_updates_http_version("1.1")   # avoid HTTP/2 write-stall on polling
+        .http_version("1.1")               # avoid HTTP/2 write-stall on sends
+        .build()
+    )
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help",  help_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
