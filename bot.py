@@ -54,7 +54,7 @@ os.makedirs(PLOT_FOLDER, exist_ok=True)
 os.environ["TOGETHER_API_KEY"] = TOGETHER_API_KEY
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SESSION STORE  — in-memory, per chat_id, never touches the knowledge base
+# SESSION STORE
 # ══════════════════════════════════════════════════════════════════════════════
 _session_store: dict[int, dict] = {}
 
@@ -297,7 +297,9 @@ def _render_math_png(title: str, steps: list[tuple[str, str]], msg_id: int) -> s
         return None
 
 
-# ── Per-operation step builders ───────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# LAPLACE STEP BUILDER
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _build_laplace_steps(expr_str: str) -> tuple[list[tuple[str, str]], str]:
     steps: list[tuple[str, str]] = []
@@ -339,6 +341,10 @@ def _build_laplace_steps(expr_str: str) -> tuple[list[tuple[str, str]], str]:
         return [], f"❌ Could not compute Laplace transform: {e}"
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# FOURIER STEP BUILDER
+# ══════════════════════════════════════════════════════════════════════════════
+
 def _build_fourier_steps(expr_str: str) -> tuple[list[tuple[str, str]], str]:
     steps: list[tuple[str, str]] = []
     try:
@@ -364,6 +370,100 @@ def _build_fourier_steps(expr_str: str) -> tuple[list[tuple[str, str]], str]:
     except Exception as e:
         return [], f"❌ Could not compute Fourier transform: {e}"
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PERIODIC SUMMATION FOURIER STEP BUILDER  ← NEW
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _build_periodic_fourier_steps(
+    g_expr_str: str,
+    period: float = 2.0,
+) -> tuple[list[tuple[str, str]], str]:
+    """
+    Build step-by-step LaTeX rows for:
+        x(t) = Σ_{k=-∞}^{∞} g(t − k·T)
+
+    Uses the Poisson Summation / periodic-repetition property:
+        X(ω) = ω₀ Σ_{n=-∞}^{∞} G(n·ω₀) · δ(ω − n·ω₀)
+    where G(ω) = F{g(t)}.
+    """
+    steps: list[tuple[str, str]] = []
+    try:
+        g      = parse_ct_expr(g_expr_str)
+        g_tex  = _sympy_to_latex(g)
+        T_sym  = sp.Rational(period).limit_denominator(1000)
+        w0     = 2 * sp.pi / T_sym
+        w0_tex = _sympy_to_latex(w0)
+
+        # Step 1: State the signal
+        steps.append((
+            "Signal",
+            rf"x(t) = \sum_{{k=-\infty}}^{{\infty}} g(t - {_sympy_to_latex(T_sym)}k)"
+            rf",\quad g(t) = {g_tex}"
+        ))
+
+        # Step 2: Periodic repetition property
+        steps.append((
+            "Property",
+            rf"x(t)=\sum_k g(t-kT) \;\xrightarrow{{\mathcal{{F}}}}\;"
+            rf"X(\omega)=\omega_0\sum_{{n=-\infty}}^{{\infty}}"
+            rf"G(n\omega_0)\,\delta(\omega-n\omega_0)"
+        ))
+
+        # Step 3: Fundamental frequency
+        steps.append((
+            "Fund. freq.",
+            rf"\omega_0 = \frac{{2\pi}}{{T}} = \frac{{2\pi}}{{{_sympy_to_latex(T_sym)}}} "
+            rf"= {w0_tex}\ \mathrm{{rad/s}}"
+        ))
+
+        # Step 4: Definition of G(ω)
+        steps.append((
+            "Definition",
+            r"G(\omega) = \int_{-\infty}^{\infty} g(t)\,e^{-j\omega t}\,dt"
+        ))
+
+        # Step 5: Compute G(ω)
+        try:
+            G_result = _fourier_direct(g)
+            G_tex    = _sympy_to_latex(G_result)
+            G_tex    = re.sub(r'(?<![a-zA-Z\\])i(?![a-zA-Z0-9{])', 'j', G_tex)
+            steps.append(("G(ω)", rf"G(\omega) = {G_tex}"))
+        except Exception:
+            steps.append((
+                "G(ω)",
+                rf"G(\omega) = \int_{{-\infty}}^{{\infty}} {g_tex}\,e^{{-j\omega t}}\,dt"
+            ))
+
+        # Step 6: Substitute into summation
+        steps.append((
+            "Substitute",
+            rf"X(\omega) = {w0_tex}\sum_{{n=-\infty}}^{{\infty}}"
+            rf"G(n\cdot {w0_tex})\,\delta(\omega - n\cdot {w0_tex})"
+        ))
+
+        # Step 7: Final result
+        steps.append((
+            "Result",
+            rf"X(\omega) = \omega_0\sum_{{n=-\infty}}^{{\infty}}"
+            rf"G(n\omega_0)\,\delta(\omega-n\omega_0)"
+        ))
+
+        steps.append((
+            "Note",
+            rf"\text{{Discrete spectral lines at multiples of }}"
+            rf"\omega_0={w0_tex}\ \text{{rad/s}}"
+        ))
+
+        return steps, ""
+
+    except Exception as e:
+        return [], f"❌ Could not compute periodic Fourier transform: {e}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FOURIER SERIES STEP BUILDER
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _build_fourier_series_steps(expr_str: str, period: float,
                                  n_terms: int = 5) -> tuple[list[tuple[str, str]], str]:
@@ -594,7 +694,7 @@ def generate_plot(question: str, msg_id: int) -> str | None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LAPLACE TRANSFORM
+# LAPLACE TRANSFORM — rule identifiers & plain-text
 # ══════════════════════════════════════════════════════════════════════════════
 def _identify_laplace_rule(expr: sp.Expr) -> str:
     s = str(expr)
@@ -673,7 +773,7 @@ def compute_laplace(expr_str: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FOURIER TRANSFORM
+# FOURIER TRANSFORM — rule identifiers & plain-text
 # ══════════════════════════════════════════════════════════════════════════════
 def _identify_fourier_rule(expr: sp.Expr) -> str:
     s = str(expr)
@@ -796,7 +896,7 @@ def compute_fourier(expr_str: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FOURIER SERIES
+# FOURIER SERIES — plain-text
 # ══════════════════════════════════════════════════════════════════════════════
 def _extract_period(text: str) -> float | None:
     m = re.search(r'[Tt]\s*=\s*([0-9.]+\s*\*?\s*pi|[0-9.]+)', text)
@@ -957,15 +1057,28 @@ LAPLACE_KEYS = ["laplace", "l transform", "l{", "laplace transform",
 FOURIER_KEYS = ["fourier transform", "ft{", "fourier of", "f transform",
                 "ft of", "compute ft", "find ft", "f.t. of", "fourier tf",
                 "inverse fourier"]
-FS_KEYS   = ["fourier series", "periodic signal", "series of"]
-CONV_KEYS = ["convolution", "convolve", "f*g", "f★g", "f star g"]
+FS_KEYS      = ["fourier series", "periodic signal", "series of"]
+CONV_KEYS    = ["convolution", "convolve", "f*g", "f★g", "f star g"]
+
+# ── NEW: periodic summation keywords ──────────────────────────────────────────
+PERIODIC_FOURIER_KEYS = [
+    "sum", "summation", "periodic summation", "x(t) =", "x(t)=",
+    "k=-inf", "k = -inf", "g(t-2k)", "g(t -", "poisson",
+]
 
 
-def is_laplace(q: str) -> bool: return any(k in q for k in LAPLACE_KEYS)
-def is_fourier(q: str) -> bool: return any(k in q for k in FOURIER_KEYS)
-def is_fs(q: str)      -> bool: return any(k in q for k in FS_KEYS)
-def is_conv(q: str)    -> bool: return any(k in q for k in CONV_KEYS)
-def is_plot(q: str)    -> bool: return any(k in q for k in PLOT_KEYWORDS)
+def is_laplace(q: str) -> bool:          return any(k in q for k in LAPLACE_KEYS)
+def is_fourier(q: str) -> bool:          return any(k in q for k in FOURIER_KEYS)
+def is_fs(q: str)      -> bool:          return any(k in q for k in FS_KEYS)
+def is_conv(q: str)    -> bool:          return any(k in q for k in CONV_KEYS)
+def is_plot(q: str)    -> bool:          return any(k in q for k in PLOT_KEYWORDS)
+
+
+def is_periodic_fourier(q: str) -> bool:
+    """True when query mentions Fourier AND a periodic summation structure."""
+    has_fourier   = any(k in q for k in FOURIER_KEYS)
+    has_summation = any(k in q for k in PERIODIC_FOURIER_KEYS)
+    return has_fourier and has_summation
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1155,43 +1268,28 @@ def _extract_pdf_bytes(pdf_bytes: bytes) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ★ NEW: DOCUMENT PARSER — Feature 3
+# DOCUMENT PARSER — Feature 3
 # ══════════════════════════════════════════════════════════════════════════════
-
-# Patterns for question number detection
-_Q_MAIN    = re.compile(
+_Q_MAIN = re.compile(
     r'(?:^|\n)\s*(?:Question|Q\.?)\s*(\d+)\b[^\n]*',
     re.IGNORECASE
 )
-_Q_SUB     = re.compile(
-    r'(?:^|\n)\s*(?:(\d+)[\.\)]\s*([a-zA-Z])[\.\)]|'          # 1.a) or 1a)
-    r'\(([a-zA-Z])\)|'                                          # (a)
-    r'([a-zA-Z])[\.\)])',                                       # a) or a.
+_Q_SUB  = re.compile(
+    r'(?:^|\n)\s*(?:(\d+)[\.\)]\s*([a-zA-Z])[\.\)]|'
+    r'\(([a-zA-Z])\)|'
+    r'([a-zA-Z])[\.\)])',
     re.IGNORECASE
 )
 
 
 def _build_question_index(doc_text: str) -> list[dict]:
-    """
-    Parse the document and return a list of question blocks, each with:
-      { 'id': '1', 'sub': 'a', 'start': int, 'end': int, 'text': str }
-
-    The 'end' of each block is the start of the next block (or EOF).
-    Main question preambles (introductory text before sub-questions) are tagged
-    as sub=None so they can be prepended as context.
-    """
     blocks = []
     lines  = doc_text.split('\n')
-    pos    = 0
-
-    # Walk line by line; record where each question/sub-question starts
-    spans  = []  # (start_char, question_id, sub_id)
+    spans  = []
     char_pos = 0
 
     for line in lines:
         stripped = line.strip()
-
-        # Main question header: "Question 1", "Q2", "Q 3", etc.
         m_main = re.match(
             r'^(?:Question|Q\.?)\s*(\d+)\b',
             stripped, re.IGNORECASE
@@ -1199,19 +1297,16 @@ def _build_question_index(doc_text: str) -> list[dict]:
         if m_main:
             spans.append((char_pos, m_main.group(1), None))
 
-        # Sub-question: "(a)", "a)", "1.a)", "(i)", "i)", etc.
         m_sub = re.match(
             r'^\(?([a-zA-Z]{1,2}|[ivxlIVXL]+)\)?[\.\)]\s',
             stripped
         )
         if m_sub and spans:
-            # Only treat as sub-question if we are already inside a main question
             spans.append((char_pos, spans[-1][1] if spans else None,
                            m_sub.group(1).lower()))
 
-        char_pos += len(line) + 1  # +1 for the newline
+        char_pos += len(line) + 1
 
-    # Convert spans to blocks with start/end and text
     for i, (start, qid, sub) in enumerate(spans):
         end   = spans[i + 1][0] if i + 1 < len(spans) else len(doc_text)
         text  = doc_text[start:end].strip()
@@ -1225,43 +1320,25 @@ def _build_question_index(doc_text: str) -> list[dict]:
 
 
 def extract_question_with_context(doc_text: str, instruction: str) -> str:
-    """
-    Feature 3 core function.
-
-    Given the full document text and an instruction like "Answer Question 1(a)",
-    locate:
-      1. The main question preamble (definitions, signals, given information)
-      2. The specific sub-question text
-
-    Returns a combined context string to be passed to the LLM, or the original
-    instruction if no specific question can be resolved.
-    """
-    # Parse what the student asked for
     m = re.search(
         r'[Qq](?:uestion)?\s*(\d+)\s*[\.\(]?\s*([a-zA-Z])?',
         instruction
     )
     if not m:
-        return instruction  # No recognisable question reference — return as-is
+        return instruction
 
     target_q   = m.group(1)
     target_sub = m.group(2).lower() if m.group(2) else None
 
-    blocks = _build_question_index(doc_text)
-
-    # Find all blocks that belong to this question number
+    blocks   = _build_question_index(doc_text)
     q_blocks = [b for b in blocks if b['id'] == target_q]
     if not q_blocks:
         return instruction
 
-    # The preamble is the first block of this question (sub=None) or the block
-    # immediately before any sub-questions — it typically contains definitions
-    # of signals, given parameters, etc.
     preamble_blocks = [b for b in q_blocks if b['sub'] is None]
     preamble_text   = "\n\n".join(b['text'] for b in preamble_blocks).strip()
 
     if target_sub is None:
-        # Asked for the whole question
         full_text = "\n\n".join(b['text'] for b in q_blocks).strip()
         return (
             f"The student is asking about Question {target_q}.\n\n"
@@ -1269,10 +1346,8 @@ def extract_question_with_context(doc_text: str, instruction: str) -> str:
             f"--- Student instruction ---\n{instruction}"
         )
 
-    # Find the specific sub-question
     sub_blocks = [b for b in q_blocks if b['sub'] == target_sub]
     if not sub_blocks:
-        # Sub-question not found — still return preamble + instruction
         context = preamble_text or "(No preamble found)"
         return (
             f"The student is asking about Question {target_q}({target_sub}).\n\n"
@@ -1283,35 +1358,34 @@ def extract_question_with_context(doc_text: str, instruction: str) -> str:
         )
 
     sub_text = "\n\n".join(b['text'] for b in sub_blocks).strip()
-
     parts = [f"The student is asking about Question {target_q}({target_sub})."]
     if preamble_text:
         parts.append(
             f"--- Question {target_q} preamble / definitions "
             f"(definitions and given information) ---\n{preamble_text}"
         )
-    parts.append(
-        f"--- Question {target_q}({target_sub}) text ---\n{sub_text}"
-    )
+    parts.append(f"--- Question {target_q}({target_sub}) text ---\n{sub_text}")
     parts.append(f"--- Student instruction ---\n{instruction}")
-
     return "\n\n".join(parts)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ★ NEW: AUTO-ROUTE OCR OUTPUT — Feature 4
+# AUTO-ROUTE OCR OUTPUT — Feature 4
 # ══════════════════════════════════════════════════════════════════════════════
 
 def auto_route_extracted_text(extracted: str) -> str | None:
-    """
-    Feature 4: given OCR-extracted text, detect whether it contains a
-    Signals & Systems math problem and return a normalised command string
-    that can be passed directly to the existing math pipeline.
-
-    Returns a string like "laplace of e**(-2*t)*u(t)" if a transform is
-    detected, or None if the text should fall back to the LLM.
-    """
     lower = extracted.lower()
+
+    # ── Periodic summation Fourier (must check BEFORE generic Fourier) ────────
+    if re.search(r'sum.*g\s*\(t', lower) and "fourier" in lower:
+        g_def = re.search(r'g\s*\(\s*t\s*\)\s*=\s*([^\n,]+)', lower)
+        T_def = re.search(r'[Tt]\s*=\s*([\d\.]+)', lower)
+        g_part = g_def.group(1).strip() if g_def else "g(t)"
+        T_part = T_def.group(1) if T_def else "2"
+        return (
+            f"fourier transform of x(t) = sum g(t-{T_part}k), "
+            f"g(t) = {g_part}, T={T_part}"
+        )
 
     # ── Laplace ───────────────────────────────────────────────────────────────
     m_lap = re.search(
@@ -1369,12 +1443,11 @@ def auto_route_extracted_text(extracted: str) -> str | None:
         expr = m_plot.group(1).strip().split('\n')[0].strip(' .')
         return f"plot {expr}"
 
-    # ── Nothing matched — fall back to LLM ────────────────────────────────────
     return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SESSION-AWARE LLM CALLS — enriched prompt templates (Features 1 & 2)
+# SESSION-AWARE LLM CALLS
 # ══════════════════════════════════════════════════════════════════════════════
 _SESSION_RULES = """IMPORTANT — follow strictly:
 1. The uploaded document is the PRIMARY and authoritative source of truth.
@@ -1386,7 +1459,6 @@ _SESSION_RULES = """IMPORTANT — follow strictly:
    interpretation — do not silently substitute your own answer."""
 
 
-# ── Feature 1: Explain memo step-by-step with simplified language ─────────────
 def _prompt_explain_memo(doc_text: str, instruction: str) -> str:
     return (
         f"{_SESSION_RULES}\n\n"
@@ -1407,7 +1479,6 @@ def _prompt_explain_memo(doc_text: str, instruction: str) -> str:
     )
 
 
-# ── Feature 2: Mark student answer with structured feedback ───────────────────
 def _prompt_mark(memo_text: str, student_work: str) -> str:
     return (
         f"{_SESSION_RULES}\n\n"
@@ -1431,7 +1502,6 @@ def _prompt_mark(memo_text: str, student_work: str) -> str:
     )
 
 
-# ── Feature 2 / existing: Solve a question from the uploaded document ─────────
 def _prompt_solve(doc_text: str, instruction: str) -> str:
     return (
         f"{_SESSION_RULES}\n\n"
@@ -1442,7 +1512,6 @@ def _prompt_solve(doc_text: str, instruction: str) -> str:
     )
 
 
-# ── General explanation ────────────────────────────────────────────────────────
 def _prompt_explain(doc_text: str, question: str) -> str:
     return (
         f"{_SESSION_RULES}\n\n"
@@ -1476,14 +1545,8 @@ def _call_llm(prompt: str, max_tokens: int = 1800) -> str:
 
 
 def _route_session_prompt(doc_text: str, instruction: str) -> str:
-    """
-    Route an instruction to the correct prompt template.
-    Now handles the 'explain memo' and 'practice examples' flows (Feature 1)
-    in addition to mark/solve/explain.
-    """
     instr_lower = instruction.lower()
 
-    # Feature 1 triggers — explain memo / generate practice problems
     if any(kw in instr_lower for kw in [
         "explain how", "explain question", "how was", "how is", "step by step",
         "walk me through", "practice", "similar example", "similar problem",
@@ -1491,14 +1554,12 @@ def _route_session_prompt(doc_text: str, instruction: str) -> str:
     ]):
         return _prompt_explain_memo(doc_text, instruction)
 
-    # Feature 2 triggers — mark / check student work
     if any(kw in instr_lower for kw in [
         "mark", "check", "compare", "correct", "feedback",
         "evaluate", "grade", "is my answer", "did i get", "how many marks"
     ]):
         return _prompt_mark(doc_text, instruction)
 
-    # Feature 3 triggers — question extraction with context
     if re.search(r'[Qq](?:uestion)?\s*\d+', instruction):
         contextual_instruction = extract_question_with_context(doc_text, instruction)
         if any(kw in instr_lower for kw in ["solve", "answer", "find", "compute",
@@ -1506,17 +1567,15 @@ def _route_session_prompt(doc_text: str, instruction: str) -> str:
             return _prompt_solve(doc_text, contextual_instruction)
         return _prompt_explain(doc_text, contextual_instruction)
 
-    # Solve / calculate
     if any(kw in instr_lower for kw in ["solve", "calculate", "find", "compute",
                                           "work out", "answer", "determine"]):
         return _prompt_solve(doc_text, instruction)
 
-    # Default — explain
     return _prompt_explain(doc_text, instruction)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# VECTOR STORE  (read-only after startup)
+# VECTOR STORE
 # ══════════════════════════════════════════════════════════════════════════════
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
@@ -1591,7 +1650,6 @@ def build_chains(vs):
     return make_rag(TUTOR_PROMPT)
 
 
-# ── Boot up vector store ───────────────────────────────────────────────────────
 vector_store = build_vector_store_if_needed(PDF_FOLDER, CHROMA_DIR)
 qa_chain     = None
 
@@ -1633,6 +1691,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "   _laplace of e^(-2*t)*u(t)_\n\n"
         "📡 *Fourier Transform*\n"
         "   _fourier transform of e^(-t)*u(t)_\n\n"
+        "📡 *Periodic Summation Fourier Transform*\n"
+        "   _fourier transform of x(t)=sum g(t-2k), g(t)=e^(-t)*u(t), T=2_\n\n"
         "🎵 *Fourier Series*\n"
         "   _fourier series of t, T=2_\n\n"
         "🔁 *Convolution*\n"
@@ -1659,14 +1719,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "   _laplace of e^(-2*t)*u(t)_\n\n"
         "2️⃣ *Fourier Transform*\n"
         "   _fourier transform of e^(-t)*u(t)_\n\n"
-        "3️⃣ *Fourier Series*\n"
+        "3️⃣ *Periodic Summation Fourier*\n"
+        "   _fourier transform of x(t)=sum g(t-2k), g(t)=e^(-t)*u(t), T=2_\n\n"
+        "4️⃣ *Fourier Series*\n"
         "   _fourier series of t**2, T=2*pi_\n\n"
-        "4️⃣ *Convolution*\n"
+        "5️⃣ *Convolution*\n"
         "   _convolve e^(-t)*u(t) with u(t)_\n\n"
-        "5️⃣ *Plot signals*\n"
+        "6️⃣ *Plot signals*\n"
         "   Continuous: _plot 2*u(t-2)_  or  _show me what u(t) looks like_\n"
         "   Discrete:   _draw u[n]-u[n-3]_\n\n"
-        "6️⃣ *Upload a PDF or image file*\n"
+        "7️⃣ *Upload a PDF or image file*\n"
         "   Send the file → bot loads it as session context\n"
         "   Then send a follow-up message:\n"
         "     _explain how Question 1(b) was solved_\n"
@@ -1674,11 +1736,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "     _give me two practice problems like Question 3_\n"
         "     _mark my work against this memo_\n"
         "   ⚠️ Uploaded files are session-only — not saved permanently.\n\n"
-        "7️⃣ *Handwritten photo or question image*\n"
+        "8️⃣ *Handwritten photo or question image*\n"
         "   📌 With caption → bot follows your instruction\n"
         "   📌 No caption   → bot reads the question and solves it automatically\n"
         "   📌 Diagrams (block diagrams, signal flow graphs) described structurally\n\n"
-        "8️⃣ *Mark calculator*\n"
+        "9️⃣ *Mark calculator*\n"
         "   _how much do I need to pass_\n\n"
         "💡 Use * for multiply, ** for power\n"
         "   e.g. e**(-2*t)*u(t)  or  e^-2t*u(t)",
@@ -1730,6 +1792,75 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── 3. Math tools ─────────────────────────────────────────────────────────
 
+    # ── Periodic summation Fourier (must be checked BEFORE generic Fourier) ───
+    if is_periodic_fourier(q_lower):
+        period_val = _extract_period(question) or 2.0
+
+        # Try to get g(t) from session document first, then from question text
+        sess  = session_get(chat_id)
+        g_str = None
+
+        if sess:
+            g_def = re.search(
+                r'g\s*\(\s*t\s*\)\s*=\s*([^\n,]+)',
+                sess["text"], re.IGNORECASE
+            )
+            if g_def:
+                g_str = g_def.group(1).strip()
+
+        if not g_str:
+            g_def_q = re.search(
+                r'g\s*\(\s*t\s*\)\s*=\s*([^,\n]+)',
+                question, re.IGNORECASE
+            )
+            g_str = g_def_q.group(1).strip() if g_def_q else None
+
+        if not g_str:
+            await update.message.reply_text(
+                "⚠️ I can see you want the Fourier transform of a periodic summation.\n\n"
+                "Please also tell me what *g(t)* is, e.g.:\n"
+                "  _fourier transform of x(t) = sum g(t-2k), g(t) = e^(-t)*u(t), T=2_",
+                parse_mode="Markdown"
+            )
+            return
+
+        await update.message.reply_text(
+            f"⏳ Computing Fourier transform of periodic summation "
+            f"(g(t) = {g_str}, T = {period_val})…"
+        )
+        steps, err = _build_periodic_fourier_steps(g_str, period_val)
+        if err:
+            await update.message.reply_text(err)
+        else:
+            png = _render_math_png(
+                "Fourier Transform  (Periodic Summation)", steps, msg_id
+            )
+            if png and os.path.exists(png):
+                await update.message.reply_photo(
+                    photo=open(png, "rb"),
+                    caption=(
+                        f"Fourier Transform of  x(t) = Σ g(t − {period_val}k)\n"
+                        f"where  g(t) = {g_str},  T = {period_val}"
+                    )
+                )
+            else:
+                lines = [
+                    "📡 Fourier Transform — Periodic Summation\n",
+                    f"x(t) = Σ g(t − {period_val}k),   g(t) = {g_str}",
+                    f"T = {period_val},   ω₀ = 2π/{period_val} = "
+                    f"{2 * 3.14159 / period_val:.4g} rad/s\n",
+                    "Property:  X(ω) = ω₀ Σ G(nω₀) · δ(ω − nω₀)\n",
+                ]
+                try:
+                    g_sym = parse_ct_expr(g_str)
+                    G_sym = _fourier_direct(g_sym)
+                    lines.append(f"G(ω) = {sp.pretty(G_sym)}\n")
+                except Exception:
+                    lines.append("G(ω) = (see definition above)\n")
+                lines.append("✅  X(ω) = ω₀ Σ_n G(n·ω₀) · δ(ω − n·ω₀)")
+                await send_long_code(update, "\n".join(lines))
+        return
+
     # ── Laplace ───────────────────────────────────────────────────────────────
     if is_laplace(q_lower):
         expr_str = extract_expr(question)
@@ -1743,7 +1874,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if err:
             await update.message.reply_text(err)
         else:
-            png = _render_math_png("📐 Laplace Transform", steps, msg_id)
+            png = _render_math_png("Laplace Transform", steps, msg_id)
             if png and os.path.exists(png):
                 await update.message.reply_photo(
                     photo=open(png, "rb"),
@@ -1765,7 +1896,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if err:
             await update.message.reply_text(err)
         else:
-            png = _render_math_png("📡 Fourier Transform", steps, msg_id)
+            png = _render_math_png("Fourier Transform", steps, msg_id)
             if png and os.path.exists(png):
                 await update.message.reply_photo(
                     photo=open(png, "rb"),
@@ -1792,7 +1923,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if err:
             await update.message.reply_text(err)
         else:
-            png = _render_math_png("🎵 Fourier Series", steps, msg_id)
+            png = _render_math_png("Fourier Series", steps, msg_id)
             if png and os.path.exists(png):
                 await update.message.reply_photo(
                     photo=open(png, "rb"),
@@ -1815,7 +1946,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if err:
             await update.message.reply_text(err)
         else:
-            png = _render_math_png("🔁 Convolution  (f ★ g)(t)", steps, msg_id)
+            png = _render_math_png("Convolution  (f ★ g)(t)", steps, msg_id)
             if png and os.path.exists(png):
                 await update.message.reply_photo(
                     photo=open(png, "rb"),
@@ -1859,7 +1990,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PHOTO HANDLER  (Feature 4: auto-route OCR output to math pipeline)
+# PHOTO HANDLER
 # ══════════════════════════════════════════════════════════════════════════════
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = (update.message.caption or "").strip()
@@ -1882,7 +2013,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sess = session_get(chat_id)
 
     if caption:
-        # Caption takes priority — use it as the instruction
         mark_keywords = ["mark", "check", "compare", "grade", "evaluate", "feedback"]
         if sess and any(kw in caption.lower() for kw in mark_keywords):
             await update.message.reply_text(
@@ -1909,26 +2039,46 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "_(Session cleared — uploaded file no longer in memory.)_",
                     parse_mode="Markdown")
     else:
-        # ── Feature 4: No caption — try to auto-route the extracted question ──
+        # ── Feature 4: No caption — auto-route OCR output ─────────────────────
         routed_command = auto_route_extracted_text(extracted)
 
         if routed_command:
-            # The OCR found a recognisable math problem — handle it via the
-            # existing text pipeline as if the student typed the command.
             await update.message.reply_text(
                 f"🔍 Detected question: `{routed_command[:120]}`\n"
                 f"Solving automatically…", parse_mode="Markdown")
 
-            # Synthetic update mock — reuse handle_text logic by temporarily
-            # replacing the message text and calling the router directly.
             q_lower = routed_command.lower()
 
-            if is_laplace(q_lower):
+            # ── Periodic summation (checked first) ────────────────────────────
+            if is_periodic_fourier(q_lower):
+                period_val = _extract_period(routed_command) or 2.0
+                g_def_r    = re.search(
+                    r'g\s*\(\s*t\s*\)\s*=\s*([^,\n]+)',
+                    routed_command, re.IGNORECASE
+                )
+                g_str = g_def_r.group(1).strip() if g_def_r else None
+                if g_str:
+                    steps, err = _build_periodic_fourier_steps(g_str, period_val)
+                    if not err:
+                        png = _render_math_png(
+                            "Fourier Transform  (Periodic Summation)", steps, msg_id
+                        )
+                        if png and os.path.exists(png):
+                            await update.message.reply_photo(
+                                photo=open(png, "rb"),
+                                caption=(
+                                    f"Fourier Transform of  x(t) = Σ g(t − {period_val}k)\n"
+                                    f"where  g(t) = {g_str},  T = {period_val}"
+                                )
+                            )
+                            return
+
+            elif is_laplace(q_lower):
                 expr_str = extract_expr(routed_command)
                 if expr_str:
                     steps, err = _build_laplace_steps(expr_str)
                     if not err:
-                        png = _render_math_png("📐 Laplace Transform", steps, msg_id)
+                        png = _render_math_png("Laplace Transform", steps, msg_id)
                         if png and os.path.exists(png):
                             await update.message.reply_photo(
                                 photo=open(png, "rb"),
@@ -1942,7 +2092,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if expr_str:
                     steps, err = _build_fourier_steps(expr_str)
                     if not err:
-                        png = _render_math_png("📡 Fourier Transform", steps, msg_id)
+                        png = _render_math_png("Fourier Transform", steps, msg_id)
                         if png and os.path.exists(png):
                             await update.message.reply_photo(
                                 photo=open(png, "rb"),
@@ -1958,7 +2108,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if expr_str:
                         steps, err = _build_fourier_series_steps(expr_str, period)
                         if not err:
-                            png = _render_math_png("🎵 Fourier Series", steps, msg_id)
+                            png = _render_math_png("Fourier Series", steps, msg_id)
                             if png and os.path.exists(png):
                                 await update.message.reply_photo(
                                     photo=open(png, "rb"),
@@ -1972,7 +2122,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if e1 and e2:
                     steps, err, plot_path = _build_convolution_steps(e1, e2, msg_id)
                     if not err:
-                        png = _render_math_png("🔁 Convolution (f ★ g)(t)", steps, msg_id)
+                        png = _render_math_png("Convolution (f ★ g)(t)", steps, msg_id)
                         if png and os.path.exists(png):
                             await update.message.reply_photo(
                                 photo=open(png, "rb"),
@@ -1990,7 +2140,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         photo=open(fig_path, "rb"), caption=f"📈 {routed_command}")
                     return
 
-            # If routing matched but math pipeline failed, fall through to LLM
+            # Routing matched but math pipeline failed — fall through to LLM
             if qa_chain:
                 await update.message.reply_text("🤔 Solving with tutor…")
                 try:
@@ -2003,7 +2153,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "⚠️ No knowledge base loaded. Try adding a caption with your question.")
 
         else:
-            # No math pattern found — handle as handwritten work / diagram
+            # No math pattern found
             if sess:
                 context.user_data["pending_student_work"] = extracted
                 await update.message.reply_text(
