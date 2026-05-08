@@ -5,6 +5,7 @@ import re
 import base64
 import requests
 import tempfile
+import textwrap
 
 # ── Matplotlib non-interactive backend (must be set before pyplot import) ──────
 import matplotlib
@@ -202,22 +203,52 @@ def extract_expr(question: str) -> str | None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LATEX / MATHTEXT SANITISER
+# LATEX / MATHTEXT SANITISER  (FIX 1: full unicode → LaTeX mapping)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _sanitise_mathtext(s: str) -> str:
+    # ── Unicode symbols → LaTeX commands (MUST happen first) ──────────────────
+    s = s.replace('∞', r'\infty')
+    s = s.replace('∑', r'\sum')
+    s = s.replace('∫', r'\int')
+    s = s.replace('∏', r'\prod')
+    s = s.replace('δ', r'\delta')
+    s = s.replace('Δ', r'\Delta')
+    s = s.replace('ω', r'\omega')
+    s = s.replace('Ω', r'\Omega')
+    s = s.replace('π', r'\pi')
+    s = s.replace('α', r'\alpha')
+    s = s.replace('β', r'\beta')
+    s = s.replace('τ', r'\tau')
+    s = s.replace('σ', r'\sigma')
+    s = s.replace('μ', r'\mu')
+    s = s.replace('λ', r'\lambda')
+    s = s.replace('θ', r'\theta')
+    s = s.replace('φ', r'\phi')
+    s = s.replace('★', r'\star')
+    s = s.replace('·', r'\cdot')
+    s = s.replace('×', r'\times')
+    s = s.replace('≈', r'\approx')
+    s = s.replace('≥', r'\geq')
+    s = s.replace('≤', r'\leq')
+    s = s.replace('≠', r'\neq')
+    # ── Heaviside theta notation ───────────────────────────────────────────────
     s = re.sub(r'\\theta\\left\(([^)]+)\\right\)', r'u(\1)', s)
     s = s.replace(r'\theta\left(t\right)', r'u(t)')
+    # ── Imaginary unit i → j ──────────────────────────────────────────────────
     s = re.sub(r'(?<![a-zA-Z\\])i(?![a-zA-Z0-9{\\])', 'j', s)
-    s = re.sub(r'\\mathcal\{([^}]+)\}',     r'\\mathbf{\1}', s)
-    s = re.sub(r'\\mathscr\{([^}]+)\}',     r'\\mathbf{\1}', s)
-    s = re.sub(r'\\mathrm\{([^}]+)\}',      r'\\rm \1',      s)
-    s = re.sub(r'\\operatorname\{([^}]+)\}', r'\\rm \1',     s)
-    s = re.sub(r'\\text\{([^}]*)\}',        r'\\rm \1',      s)
+    # ── Unsupported LaTeX envs → mathtext equivalents ─────────────────────────
+    s = re.sub(r'\\mathcal\{([^}]+)\}',      r'\\mathbf{\1}', s)
+    s = re.sub(r'\\mathscr\{([^}]+)\}',      r'\\mathbf{\1}', s)
+    s = re.sub(r'\\mathrm\{([^}]+)\}',       r'\\rm \1',      s)
+    s = re.sub(r'\\operatorname\{([^}]+)\}',  r'\\rm \1',      s)
+    s = re.sub(r'\\text\{([^}]*)\}',          r'\\rm \1',      s)
+    # ── Spacing macros ────────────────────────────────────────────────────────
     s = s.replace(r'\qquad', r'\ \ \ \ ')
     s = s.replace(r'\quad',  r'\ \ ')
     s = s.replace(r'\,',     r'\ ')
     s = s.replace(r'\;',     r'\ ')
+    # ── Remove \left \right (not supported in mathtext) ───────────────────────
     s = re.sub(r'\\left\s*',  '', s)
     s = re.sub(r'\\right\s*', '', s)
     return s
@@ -232,7 +263,7 @@ def _sympy_to_latex(expr: sp.Expr) -> str:
 
 
 def _try_render_row(ax, x_label: float, x_expr: float, y: float,
-                    label: str, latex_str: str, fontsize: int = 20) -> None:
+                    label: str, latex_str: str, fontsize: int = 22) -> None:
     ax.text(x_label, y, f"{label}:",
             transform=ax.transAxes,
             fontsize=fontsize - 1, fontweight="bold",
@@ -256,11 +287,11 @@ def _try_render_row(ax, x_label: float, x_expr: float, y: float,
 def _render_math_png(title: str, steps: list[tuple[str, str]], msg_id: int) -> str | None:
     try:
         n       = len(steps)
-        FONT    = 20
-        ROW_IN  = 0.80
-        PAD_IN  = 1.4
-        fig_h   = max(3.0, n * ROW_IN + PAD_IN)
-        fig_w   = 12.0
+        FONT    = 22           # bumped from 20
+        ROW_IN  = 0.95         # bumped from 0.80
+        PAD_IN  = 1.6          # bumped from 1.4
+        fig_h   = max(4.0, n * ROW_IN + PAD_IN)
+        fig_w   = 16.0         # bumped from 12.0
 
         fig, ax = plt.subplots(figsize=(fig_w, fig_h), facecolor="white")
         ax.set_facecolor("white")
@@ -271,7 +302,7 @@ def _render_math_png(title: str, steps: list[tuple[str, str]], msg_id: int) -> s
         title_clean = re.sub(r'[^\x00-\x7F]+', '', title).strip()
         ax.text(0.5, 0.97, title_clean,
                 transform=ax.transAxes,
-                fontsize=FONT + 3, fontweight="bold",
+                fontsize=FONT + 4, fontweight="bold",
                 ha="center", va="top", color="#1a1a2e", usetex=False)
 
         divider_y = 1.0 - (PAD_IN * 0.45 / fig_h)
@@ -302,7 +333,7 @@ def _render_math_png(title: str, steps: list[tuple[str, str]], msg_id: int) -> s
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LLM RESPONSE RENDERER
+# LLM RESPONSE RENDERER  (FIX 2: larger fonts, wider canvas, text wrapping)
 # ══════════════════════════════════════════════════════════════════════════════
 
 _PLAIN_TO_MATHTEXT = [
@@ -319,12 +350,13 @@ _PLAIN_TO_MATHTEXT = [
     (r'\bsinc\b',        r'\\mathrm{sinc}'),
 ]
 
+# FIX 3: extended _EQ_LINE_RE to catch lines containing unicode ∞, ∑, ∫, ∏
 _EQ_LINE_RE = re.compile(
     r'^.*(?:'
     r'[A-Za-zΩωπδτ]\([^)]*\)\s*='
     r'|=\s*\\frac'
     r'|\\int'
-    r'|[∫∑∏]'
+    r'|[∫∑∏∞]'
     r'|(?:\^|_)\{[^}]+\}'
     r').*$',
     re.IGNORECASE
@@ -377,18 +409,25 @@ def render_response_png(llm_text: str, title: str, msg_id: int) -> str | None:
     if not rows:
         return None
 
-    FIG_W     = 13.0
-    PROSE_FS  = 13
-    MATH_FS   = 15
-    LINE_H    = 0.38
-    MATH_H    = 0.55
-    TITLE_H   = 0.65
-    PAD       = 0.4
+    # ── Layout constants (FIX 2: larger sizes) ────────────────────────────────
+    FIG_W     = 18.0       # was 13.0 — wider canvas prevents text overflow
+    PROSE_FS  = 17         # was 13   — readable prose size
+    MATH_FS   = 22         # was 15   — prominent equations
+    LINE_H    = 0.55       # was 0.38 — more breathing room between lines
+    MATH_H    = 0.80       # was 0.55 — taller rows for equations
+    TITLE_H   = 0.85       # was 0.65
+    PAD       = 0.5
 
+    # Pre-calculate figure height accounting for wrapped prose lines
+    WRAP_WIDTH = 115       # characters before wrapping prose
     total_h = TITLE_H + PAD
-    for kind, _ in rows:
-        total_h += MATH_H if kind == 'math' else LINE_H
-    total_h = max(4.0, total_h)
+    for kind, txt in rows:
+        if kind == 'math':
+            total_h += MATH_H
+        else:
+            n_lines = max(1, len(textwrap.wrap(txt, width=WRAP_WIDTH)) if txt.strip() else 1)
+            total_h += LINE_H * n_lines
+    total_h = max(5.0, total_h)
 
     fig, ax = plt.subplots(figsize=(FIG_W, total_h), facecolor='white')
     ax.set_facecolor('white')
@@ -398,10 +437,10 @@ def render_response_png(llm_text: str, title: str, msg_id: int) -> str | None:
 
     y = total_h - 0.15
     ax.text(0.5, y, title,
-            fontsize=16, fontweight='bold', color='#1a1a2e',
+            fontsize=18, fontweight='bold', color='#1a1a2e',
             ha='center', va='top', usetex=False)
     y -= TITLE_H
-    ax.plot([0.02, 0.98], [y + 0.08, y + 0.08],
+    ax.plot([0.02, 0.98], [y + 0.10, y + 0.10],
             color='#cccccc', linewidth=1.0)
 
     INDENT      = 0.03
@@ -424,15 +463,31 @@ def render_response_png(llm_text: str, title: str, msg_id: int) -> str | None:
                         va='top', ha='left', fontfamily='monospace', usetex=False)
             y -= MATH_H
         else:
+            # Strip markdown bold/italic markers for display
             display = re.sub(r'\*\*?([^*]+)\*\*?', r'\1', txt)
             display = re.sub(r'__?([^_]+)__?',      r'\1', display)
-            is_heading = bool(re.match(r'\*\*', txt) or re.match(r'Step\s+\d+', txt.strip()))
-            ax.text(INDENT, y, display,
+            is_heading = bool(re.match(r'\*\*', txt) or re.match(r'Step\s+\d+', txt.strip())
+                              or re.match(r'Problem\s+\d+', txt.strip())
+                              or re.match(r'Why it', txt.strip())
+                              or re.match(r'Study Tip', txt.strip()))
+
+            # Wrap long prose lines so they don't overflow the canvas
+            if display.strip():
+                wrapped_lines = textwrap.wrap(display, width=WRAP_WIDTH)
+                if not wrapped_lines:
+                    wrapped_lines = [display]
+            else:
+                wrapped_lines = [display]
+
+            wrapped_display = '\n'.join(wrapped_lines)
+            n_wrapped = len(wrapped_lines)
+
+            ax.text(INDENT, y, wrapped_display,
                     fontsize=PROSE_FS,
                     color='#1a1a2e' if is_heading else '#222222',
                     fontweight='bold' if is_heading else 'normal',
                     va='top', ha='left', usetex=False)
-            y -= LINE_H
+            y -= LINE_H * n_wrapped
 
     fig.tight_layout(pad=0.3)
     path = os.path.join(PLOT_FOLDER, f'response_{msg_id}.png')
@@ -1578,14 +1633,14 @@ def auto_route_extracted_text(extracted: str) -> str | None:
 # SESSION-AWARE LLM PROMPTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-# FIX: All curly braces that are NOT template variables must be doubled so
-# that PromptTemplate.from_template() does not mistake them for variables.
 _LATEX_INSTRUCTION = (
     "FORMATTING RULE: Wrap ALL mathematical expressions, equations, and formulas "
     "using LaTeX notation: $...$ for inline math and $$...$$ for display/standalone equations. "
     "For example, write $G(\\omega) = \\frac{{1}}{{a + j\\omega}}$ not G(omega) = 1/(a+jw). "
     "Use standard LaTeX commands: \\frac{{}}{{}}, \\int, \\sum, \\omega, \\delta, \\pi, "
-    "\\mathcal{{L}}, \\mathcal{{F}}, e^{{-st}}, etc."
+    "\\mathcal{{L}}, \\mathcal{{F}}, e^{{-st}}, etc. "
+    "CRITICAL: For summations always write $$\\sum_{{k=-\\infty}}^{{\\infty}}$$ NOT the "
+    "unicode character ∑ or ∞ outside of math delimiters."
 )
 
 _SESSION_RULES = (
@@ -1618,7 +1673,8 @@ def _prompt_explain_memo(doc_text: str, instruction: str) -> str:
         f"the worked solution.\n"
         f"5. End with one short study tip specific to this technique.\n"
         f"Be concise but thorough. Use numbered steps. "
-        f"Wrap all math in $...$ or $$...$$."
+        f"Wrap all math in $...$ or $$...$$. "
+        f"Always write summation limits as $$\\sum_{{k=-\\infty}}^{{\\infty}}$$ in LaTeX."
     )
 
 
@@ -1760,16 +1816,15 @@ def build_vector_store_if_needed(pdf_folder: str, chroma_dir: str):
 # RAG CHAINS
 # ══════════════════════════════════════════════════════════════════════════════
 
-# FIX: All literal curly braces inside the PromptTemplate string that are NOT
-# {context} or {question} placeholders must be doubled: { → {{ and } → }}
-# This prevents LangChain from treating them as variable names.
 TUTOR_PROMPT = PromptTemplate.from_template(
     "You are a Signals and Systems tutor assistant.\n\n"
     "FORMATTING RULE: Wrap ALL mathematical expressions, equations, and formulas "
     "using LaTeX notation: $...$ for inline math and $$...$$ for display equations. "
     "For example, write $G(\\omega) = \\frac{{1}}{{a + j\\omega}}$ not G(omega) = 1/(a+jw). "
     "Use standard LaTeX commands: \\frac{{}}{{}}, \\int, \\sum, \\omega, \\delta, \\pi, "
-    "\\mathcal{{L}}, \\mathcal{{F}}, e^{{-st}}, etc.\n\n"
+    "\\mathcal{{L}}, \\mathcal{{F}}, e^{{-st}}, etc. "
+    "CRITICAL: Always write summation limits as $$\\sum_{{k=-\\infty}}^{{\\infty}}$$ "
+    "in LaTeX — never use unicode ∑ or ∞ outside of $...$ delimiters.\n\n"
     "First, silently classify the student's question into one of three types:\n"
     "  A) FACTUAL — asking for course info, dates, definitions, or simple facts\n"
     "  B) CONCEPTUAL — asking to understand an idea, theorem, or technique\n"
