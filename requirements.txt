@@ -4,6 +4,7 @@ langchain-community
 langchain-huggingface
 langchain-together
 langchain-text-splitters
+langchain-chroma
 chromadb==0.5.23
 sentence-transformers==2.7.0
 pypdf
