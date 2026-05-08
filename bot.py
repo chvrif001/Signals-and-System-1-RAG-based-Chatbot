@@ -2489,7 +2489,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        f"📄 Received *{file_name}* — extracting content…\n"
+        f"📄 Received *{file_name}* — extracting content…\n",
         parse_mode="Markdown")
 
     tg_file = await doc.get_file()
