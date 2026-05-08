@@ -6,6 +6,11 @@ import base64
 import requests
 import tempfile
 import textwrap
+import warnings
+
+# ── Suppress warnings ──────────────────────────────────────────────────────────
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 # ── Matplotlib non-interactive backend (must be set before pyplot import) ──────
 import matplotlib
@@ -14,15 +19,21 @@ import matplotlib.pyplot as plt
 import numpy as np
 import sympy as sp
 
+# ── Suppress HuggingFace verbose logging ──────────────────────────────────────
+from transformers import logging as hf_logging
+hf_logging.set_verbosity_error()
+
 from langchain_community.document_loaders import PyPDFDirectoryLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import Chroma
+from langchain_chroma import Chroma
 from langchain_together import ChatTogether
 from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 from sentence_transformers import SentenceTransformer
+import chromadb
+from chromadb.config import Settings
 
 from telegram import Update
 from telegram.ext import (
@@ -102,7 +113,6 @@ def _rect(x):
 def _normalise(expr: str) -> str:
     s = expr.strip()
     s = s.replace("^", "**").replace("{", "(").replace("}", ")")
-    # rect() — keep as-is for sympify with our custom namespace
     s = re.sub(r'\brect\s*\(',                       'rect(',          s)
     s = re.sub(r'\bu\s*\(\s*t\s*\)',                 'Heaviside(t)',   s)
     s = re.sub(r'\bu\s*\(\s*t\s*([+-][^)]+)\)',      r'Heaviside(t\1)', s)
@@ -231,25 +241,18 @@ _MATH_TITLE_KEYWORDS = (
     "derivation",
     "calculation",
     "equation",
-    "answer —",        # session-doc answers (may contain heavy maths)
+    "answer —",
     "marking feedback",
-    "tutor answer",    # RAG answers that contain step-by-step maths
+    "tutor answer",
 )
 
-# These titles are ALWAYS plain text regardless of content
 _PLAIN_TEXT_TITLES = (
     "tutor answer",
 )
 
 
 def _is_math_title(title: str) -> bool:
-    """
-    Return True only when the response title indicates mathematical content
-    that benefits from PNG rendering (transforms, convolutions, session docs).
-    Plain Q&A / concept explanations return False → plain text reply.
-    """
     t = title.lower()
-    # Explicit plain-text overrides first
     if any(kw in t for kw in _PLAIN_TEXT_TITLES):
         return False
     return any(kw in t for kw in _MATH_TITLE_KEYWORDS)
@@ -304,6 +307,17 @@ def _sanitise_mathtext(s: str) -> str:
     # ── Remove \left \right (not supported in mathtext) ───────────────────────
     s = re.sub(r'\\left\s*',  '', s)
     s = re.sub(r'\\right\s*', '', s)
+    # ── Ensure spacing after Greek/math commands before letters ───────────────
+    # e.g. \piG → \pi G, \omegaX → \omega X
+    s = re.sub(
+        r'(\\(?:pi|alpha|beta|gamma|delta|epsilon|zeta|eta|theta|iota|kappa|'
+        r'lambda|mu|nu|xi|rho|sigma|tau|upsilon|phi|chi|psi|omega|'
+        r'Gamma|Delta|Theta|Lambda|Xi|Pi|Sigma|Upsilon|Phi|Psi|Omega|'
+        r'infty|cdot|times|star|approx|geq|leq|neq|sum|int|prod|rm|mathbf))'
+        r'(?=[A-Za-z])',
+        r'\1 ',
+        s
+    )
     return s
 
 
@@ -372,7 +386,11 @@ def _render_math_png(title: str, steps: list[tuple[str, str]], msg_id: int) -> s
             if y < 0.01:
                 break
 
-        fig.tight_layout(pad=0.5)
+        try:
+            fig.tight_layout(pad=0.5)
+        except Exception as e:
+            print(f"[_render_math_png] tight_layout failed (non-fatal): {e}")
+
         path = os.path.join(PLOT_FOLDER, f"math_{msg_id}.png")
         fig.savefig(path, dpi=180, bbox_inches="tight",
                     facecolor="white", edgecolor="none")
@@ -461,15 +479,15 @@ def render_response_png(llm_text: str, title: str, msg_id: int) -> str | None:
     if not rows:
         return None
 
-    FIG_W     = 22.0
-    PROSE_FS  = 22
-    MATH_FS   = 28
-    LINE_H    = 0.75
-    MATH_H    = 1.10
-    TITLE_H   = 1.10
-    PAD       = 0.8
-
+    FIG_W      = 22.0
+    PROSE_FS   = 22
+    MATH_FS    = 28
+    LINE_H     = 0.75
+    MATH_H     = 1.10
+    TITLE_H    = 1.10
+    PAD        = 0.8
     WRAP_WIDTH = 100
+
     total_h = TITLE_H + PAD
     for kind, txt in rows:
         if kind == 'math':
@@ -479,10 +497,11 @@ def render_response_png(llm_text: str, title: str, msg_id: int) -> str | None:
             total_h += LINE_H * n_lines
     total_h = max(8.0, total_h)
 
-
+    # ── Multi-page split ──────────────────────────────────────────────────────
     MAX_PAGE_H = 40.0
+    render_response_png._extra_pages = []
+
     if total_h > MAX_PAGE_H:
-        # Split rows into pages and render each as a separate file
         pages = []
         page_rows = []
         page_h = TITLE_H + PAD
@@ -503,9 +522,7 @@ def render_response_png(llm_text: str, title: str, msg_id: int) -> str | None:
         if page_rows:
             pages.append(page_rows)
 
-        # Render only the first page and save; send remaining pages separately
-        # by storing them in a temp attribute on the function
-        render_response_png._extra_pages = []
+        # Render extra pages (page 2+)
         for pi, p_rows in enumerate(pages[1:], start=2):
             p_h = max(8.0, sum(
                 MATH_H if k == 'math'
@@ -551,23 +568,25 @@ def render_response_png(llm_text: str, title: str, msg_id: int) -> str | None:
                               fontweight='bold' if is_heading else 'normal',
                               va='top', ha='left', usetex=False)
                     p_y -= LINE_H * len(wrapped_lines)
-            p_fig.tight_layout(pad=0.3)
+            try:
+                p_fig.tight_layout(pad=0.3)
+            except Exception as e:
+                print(f"[render_response_png] page tight_layout failed (non-fatal): {e}")
             p_path = os.path.join(PLOT_FOLDER, f'response_{msg_id}_p{pi}.png')
             p_fig.savefig(p_path, dpi=200, bbox_inches='tight',
                           facecolor='white', edgecolor='none')
             plt.close('all')
             render_response_png._extra_pages.append(p_path)
 
+        # Use only first page rows for main render
         rows = pages[0]
         total_h = max(8.0, sum(
             MATH_H if k == 'math'
             else LINE_H * max(1, len(textwrap.wrap(t, width=WRAP_WIDTH)) if t.strip() else 1)
             for k, t in rows
         ) + TITLE_H + PAD)
-    else:
-        render_response_png._extra_pages = []
 
-    
+    # ── Render main (first) page ──────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(FIG_W, total_h), facecolor='white')
     ax.set_facecolor('white')
     ax.axis('off')
@@ -626,7 +645,11 @@ def render_response_png(llm_text: str, title: str, msg_id: int) -> str | None:
                     va='top', ha='left', usetex=False)
             y -= LINE_H * n_wrapped
 
-    fig.tight_layout(pad=0.3)
+    try:
+        fig.tight_layout(pad=0.3)
+    except Exception as e:
+        print(f"[render_response_png] tight_layout failed (non-fatal): {e}")
+
     path = os.path.join(PLOT_FOLDER, f'response_{msg_id}.png')
     fig.savefig(path, dpi=200, bbox_inches='tight',
                 facecolor='white', edgecolor='none')
@@ -640,10 +663,6 @@ def render_response_png(llm_text: str, title: str, msg_id: int) -> str | None:
 
 async def _send_photo_with_retry(update: Update, path: str, caption: str,
                                   retries: int = 3, delay: float = 5.0) -> bool:
-    """
-    Try to send a photo up to `retries` times with exponential back-off.
-    Returns True on success, False if all attempts fail.
-    """
     for attempt in range(1, retries + 1):
         try:
             with open(path, "rb") as f:
@@ -655,39 +674,30 @@ async def _send_photo_with_retry(update: Update, path: str, caption: str,
         except Exception as exc:
             print(f"[send_photo] attempt {attempt}/{retries} failed: {exc}")
             if attempt < retries:
-                await asyncio.sleep(delay * attempt)   # 5 s, 10 s, …
+                await asyncio.sleep(delay * attempt)
     return False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SEND LLM RESPONSE  (plain text by default; PNG only for maths/transforms)
+# SEND LLM RESPONSE
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def send_llm_response(update: Update, response_text: str,
                              title: str, msg_id: int,
                              force_image: bool = False) -> None:
-    """
-    Routing logic:
-      • force_image=True  OR  _is_math_title(title) → attempt PNG render
-      • otherwise → plain text reply_text (no image generated at all)
-
-    If PNG rendering is attempted but the photo send fails after retries,
-    the function falls back to plain text automatically.
-    """
     if force_image or _is_math_title(title):
         png = render_response_png(response_text, title, msg_id)
         if png and os.path.exists(png):
             success = await _send_photo_with_retry(update, png, title)
             if success:
+                # Send any extra pages (multi-page split)
                 for extra in getattr(render_response_png, '_extra_pages', []):
                     if os.path.exists(extra):
                         await _send_photo_with_retry(update, extra, f"{title} (cont.)")
                 return
-            # All retries exhausted — fall through to plain text
             print(f"[send_llm_response] photo send failed after retries, "
                   f"falling back to plain text for title='{title}'")
 
-    # Plain-text path (default for general Q&A, and fallback for failed photos)
     for i in range(0, len(response_text), 4096):
         await update.message.reply_text(response_text[i:i + 4096])
 
@@ -814,11 +824,6 @@ def _build_periodic_fourier_steps(
             rf"X(\omega) = \omega_0\sum_{{n=-\infty}}^{{\infty}}"
             rf"G(n\omega_0)\,\delta(\omega-n\omega_0)"
         ))
-        steps.append((
-            "Note",
-            rf"\text{{Discrete spectral lines at multiples of }}"
-            rf"\omega_0={w0_tex}\ \text{{rad/s}}"
-        ))
 
         return steps, ""
     except Exception as e:
@@ -934,12 +939,8 @@ def _build_convolution_steps(expr1_str: str, expr2_str: str,
     if causal_limits is not None:
         lower, upper = causal_limits
         limits = (tau, lower, upper)
-        lower_tex = _sympy_to_latex(lower)
-        upper_tex = _sympy_to_latex(upper)
-      
     else:
         limits = (tau, -sp.oo, sp.oo)
-       
 
     try:
         result = sp.integrate(integrand, limits)
@@ -1125,10 +1126,6 @@ def compute_laplace(expr_str: str) -> str:
         result = sp.laplace_transform(f, t_sym, s_sym, noconds=True)
         result = sp.simplify(result)
         lines.append(f"Step 3 — Final result:\n   F(s) = {sp.pretty(result)}\n")
-        if "exp" in str(f):
-            lines.append("ROC hint: Re(s) > -a  (right-sided exponential signal)")
-        elif "Heaviside" in str(f):
-            lines.append("ROC hint: Re(s) > 0  (causal signal)")
         lines.append(f"\n✅  F(s) = {sp.pretty(result)}")
     except Exception as e:
         lines.append(f"❌ SymPy could not find a closed form: {e}")
@@ -1161,18 +1158,17 @@ def _identify_fourier_rule_latex(expr: sp.Expr) -> str:
     if "DiracDelta" in s:
         return r"\mathcal{F}\{\delta(t)\} = 1"
     if "Heaviside" in s and "exp" not in s:
-        return r"\mathcal{F}\{u(t)\} = \pi\delta(\omega) + \frac{1}{j\omega}"
+        return r"\mathcal{F}\{u(t)\} = \pi \delta(\omega) + \frac{1}{j\omega}"
     if "exp" in s and "sin" not in s and "cos" not in s:
         return r"\mathcal{F}\{e^{-at}u(t)\} = \frac{1}{a+j\omega},\quad a>0"
     if "sin" in s:
-        return r"\mathcal{F}\{\sin(\omega_0 t)\} = j\pi[\delta(\omega+\omega_0)-\delta(\omega-\omega_0)]"
+        return r"\mathcal{F}\{\sin(\omega_0 t)\} = j\pi [\delta(\omega+\omega_0)-\delta(\omega-\omega_0)]"
     if "cos" in s:
-        return r"\mathcal{F}\{\cos(\omega_0 t)\} = \pi[\delta(\omega+\omega_0)+\delta(\omega-\omega_0)]"
+        return r"\mathcal{F}\{\cos(\omega_0 t)\} = \pi [\delta(\omega+\omega_0)+\delta(\omega-\omega_0)]"
     if expr == sp.Integer(1):
-        return r"\mathcal{F}\{1\} = 2\pi\delta(\omega)"
-    # rect-based pair
+        return r"\mathcal{F}\{1\} = 2\pi \delta(\omega)"
     if "Piecewise" in str(expr):
-        return r"\mathcal{F}\{\mathrm{rect}(t/\tau)\} = \tau\,\mathrm{sinc}(\omega\tau/2)"
+        return r"\mathcal{F}\{\mathrm{rect}(t/\tau)\} = \tau \,\mathrm{sinc}(\omega \tau /2)"
     return r"F(\omega) = \int_{-\infty}^{\infty} f(t)\,e^{-j\omega t}\,dt"
 
 
@@ -1251,10 +1247,6 @@ def compute_fourier(expr_str: str) -> str:
     try:
         result = _fourier_direct(f)
         lines.append(f"Step 3 — Final result:\n   F(ω) = {sp.pretty(result)}\n")
-        if "Heaviside" in str(f) and "exp" in str(f):
-            lines.append("Magnitude |F(ω)|: low-pass characteristic — decays as 1/ω")
-        elif "cos" in str(f) or "sin" in str(f):
-            lines.append("Note: Result contains Dirac deltas — spectrum consists of discrete lines.")
         lines.append(f"\n✅  F(ω) = {sp.pretty(result)}")
     except Exception as e:
         lines.append(f"❌ Could not evaluate: {e}")
@@ -1815,7 +1807,9 @@ _LATEX_INSTRUCTION = (
     "Use standard LaTeX commands: \\frac{{}}{{}}, \\int, \\sum, \\omega, \\delta, \\pi, "
     "\\mathcal{{L}}, \\mathcal{{F}}, e^{{-st}}, etc. "
     "CRITICAL: For summations always write $$\\sum_{{k=-\\infty}}^{{\\infty}}$$ NOT the "
-    "unicode character ∑ or ∞ outside of math delimiters."
+    "unicode character ∑ or ∞ outside of math delimiters. "
+    "CRITICAL: Always insert a space between LaTeX commands and following letters, "
+    "e.g. write $\\pi G(\\omega)$ NOT $\\piG(\\omega)$, write $\\omega_0 T$ NOT $\\omega_0T$."
 )
 
 _SESSION_RULES = (
@@ -1849,7 +1843,8 @@ def _prompt_explain_memo(doc_text: str, instruction: str) -> str:
         f"5. End with one short study tip specific to this technique.\n"
         f"Be concise but thorough. Use numbered steps. "
         f"Wrap all math in $...$ or $$...$$. "
-        f"Always write summation limits as $$\\sum_{{k=-\\infty}}^{{\\infty}}$$ in LaTeX."
+        f"Always write summation limits as $$\\sum_{{k=-\\infty}}^{{\\infty}}$$ in LaTeX. "
+        f"Always space LaTeX commands from following letters: $\\pi G$ not $\\piG$."
     )
 
 
@@ -1959,14 +1954,23 @@ EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
 def build_vector_store_if_needed(pdf_folder: str, chroma_dir: str):
     embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+
     if os.path.exists(chroma_dir) and os.listdir(chroma_dir):
         print("✅ Loading existing ChromaDB from volume...")
-        vs    = Chroma(persist_directory=chroma_dir, embedding_function=embeddings)
-        count = vs._collection.count()
-        print(f"   {count} vectors loaded.")
-        if count > 0:
-            return vs
-        print("   Index was empty — rebuilding...")
+        try:
+            client = chromadb.PersistentClient(
+                path=chroma_dir,
+                settings=Settings(anonymized_telemetry=False)
+            )
+            vs    = Chroma(client=client, embedding_function=embeddings)
+            count = vs._collection.count()
+            print(f"   {count} vectors loaded.")
+            if count > 0:
+                return vs
+            print("   Index was empty — rebuilding...")
+        except Exception as e:
+            print(f"   Failed to load existing DB: {e} — rebuilding...")
+
     print("📄 Building ChromaDB from PDFs in knowledge_base/...")
     pdf_files = [f for f in os.listdir(pdf_folder) if f.endswith(".pdf")]
     if not pdf_files:
@@ -1980,9 +1984,11 @@ def build_vector_store_if_needed(pdf_folder: str, chroma_dir: str):
     )
     chunks = splitter.split_documents(docs)
     print(f"   {len(docs)} pages → {len(chunks)} chunks")
-    vs = Chroma.from_documents(chunks, embedding=embeddings,
-                               persist_directory=chroma_dir)
-    vs.persist()
+    client = chromadb.PersistentClient(
+        path=chroma_dir,
+        settings=Settings(anonymized_telemetry=False)
+    )
+    vs = Chroma.from_documents(chunks, embedding=embeddings, client=client)
     print(f"   ✅ {vs._collection.count()} vectors saved to {chroma_dir}")
     return vs
 
@@ -1999,7 +2005,9 @@ TUTOR_PROMPT = PromptTemplate.from_template(
     "Use standard LaTeX commands: \\frac{{}}{{}}, \\int, \\sum, \\omega, \\delta, \\pi, "
     "\\mathcal{{L}}, \\mathcal{{F}}, e^{{-st}}, etc. "
     "CRITICAL: Always write summation limits as $$\\sum_{{k=-\\infty}}^{{\\infty}}$$ "
-    "in LaTeX — never use unicode ∑ or ∞ outside of $...$ delimiters.\n\n"
+    "in LaTeX — never use unicode ∑ or ∞ outside of $...$ delimiters. "
+    "CRITICAL: Always insert a space between LaTeX commands and following letters, "
+    "e.g. write $\\pi G(\\omega)$ NOT $\\piG(\\omega)$.\n\n"
     "First, silently classify the student's question into one of three types:\n"
     "  A) FACTUAL — asking for course info, dates, definitions, or simple facts\n"
     "  B) CONCEPTUAL — asking to understand an idea, theorem, or technique\n"
@@ -2375,7 +2383,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🤔 Thinking…")
     try:
         answer = qa_chain.invoke(question)
-        # General Q&A always returns plain text (title="Tutor Answer" → _is_math_title=False)
         await send_llm_response(update, answer, "Tutor Answer", msg_id)
     except Exception as e:
         await update.message.reply_text(f"❌ Something went wrong: {str(e)}")
@@ -2581,7 +2588,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        f"📄 Received *{file_name}* — extracting content…\n",
+        f"📄 Received *{file_name}* — extracting content…",
         parse_mode="Markdown")
 
     tg_file = await doc.get_file()
@@ -2605,7 +2612,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session_store(chat_id, extracted, source)
 
     await update.message.reply_text(
-        f"✅ Content loaded from *{source}*.\n\n"
+        f"✅ *{source}* loaded successfully.\n\n"
         f"Now tell me what you'd like me to do:\n"
         f"  - Explain how Question 1(b) was solved\n"
         f"  - Answer Question 2(a)\n"
@@ -2629,14 +2636,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MAIN  — HTTP/1.1 forced to avoid write-stall on photo uploads
+# MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 async def main():
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
-        .get_updates_http_version("1.1")   # avoid HTTP/2 write-stall on polling
-        .http_version("1.1")               # avoid HTTP/2 write-stall on sends
+        .get_updates_http_version("1.1")
+        .http_version("1.1")
         .build()
     )
 
