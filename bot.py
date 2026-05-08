@@ -461,15 +461,15 @@ def render_response_png(llm_text: str, title: str, msg_id: int) -> str | None:
     if not rows:
         return None
 
-    FIG_W     = 18.0
-    PROSE_FS  = 17
-    MATH_FS   = 22
-    LINE_H    = 0.55
-    MATH_H    = 0.80
-    TITLE_H   = 0.85
-    PAD       = 0.5
+    FIG_W     = 22.0
+    PROSE_FS  = 22
+    MATH_FS   = 28
+    LINE_H    = 0.75
+    MATH_H    = 1.10
+    TITLE_H   = 1.10
+    PAD       = 0.8
 
-    WRAP_WIDTH = 115
+    WRAP_WIDTH = 100
     total_h = TITLE_H + PAD
     for kind, txt in rows:
         if kind == 'math':
@@ -477,8 +477,97 @@ def render_response_png(llm_text: str, title: str, msg_id: int) -> str | None:
         else:
             n_lines = max(1, len(textwrap.wrap(txt, width=WRAP_WIDTH)) if txt.strip() else 1)
             total_h += LINE_H * n_lines
-    total_h = max(5.0, total_h)
+    total_h = max(8.0, total_h)
 
+
+    MAX_PAGE_H = 40.0
+    if total_h > MAX_PAGE_H:
+        # Split rows into pages and render each as a separate file
+        pages = []
+        page_rows = []
+        page_h = TITLE_H + PAD
+        for row in rows:
+            kind, txt = row
+            if kind == 'math':
+                row_h = MATH_H
+            else:
+                n_lines = max(1, len(textwrap.wrap(txt, width=WRAP_WIDTH)) if txt.strip() else 1)
+                row_h = LINE_H * n_lines
+            if page_h + row_h > MAX_PAGE_H and page_rows:
+                pages.append(page_rows)
+                page_rows = [row]
+                page_h = TITLE_H + PAD + row_h
+            else:
+                page_rows.append(row)
+                page_h += row_h
+        if page_rows:
+            pages.append(page_rows)
+
+        # Render only the first page and save; send remaining pages separately
+        # by storing them in a temp attribute on the function
+        render_response_png._extra_pages = []
+        for pi, p_rows in enumerate(pages[1:], start=2):
+            p_h = max(8.0, sum(
+                MATH_H if k == 'math'
+                else LINE_H * max(1, len(textwrap.wrap(t, width=WRAP_WIDTH)) if t.strip() else 1)
+                for k, t in p_rows
+            ) + TITLE_H + PAD)
+            p_fig, p_ax = plt.subplots(figsize=(FIG_W, p_h), facecolor='white')
+            p_ax.set_facecolor('white')
+            p_ax.axis('off')
+            p_ax.set_xlim(0, 1)
+            p_ax.set_ylim(0, p_h)
+            p_y = p_h - 0.15
+            p_ax.text(0.5, p_y, f"{title}  (page {pi})",
+                      fontsize=18, fontweight='bold', color='#1a1a2e',
+                      ha='center', va='top', usetex=False)
+            p_y -= TITLE_H
+            p_ax.plot([0.02, 0.98], [p_y + 0.10, p_y + 0.10],
+                      color='#cccccc', linewidth=1.0)
+            for kind, txt in p_rows:
+                if not txt.strip():
+                    p_y -= LINE_H * 0.45
+                    continue
+                if kind == 'math':
+                    safe = _sanitise_mathtext(txt)
+                    try:
+                        p_ax.text(0.06, p_y, f'${safe}$',
+                                  fontsize=MATH_FS, color='#003388',
+                                  va='top', ha='left', usetex=False)
+                    except Exception:
+                        p_ax.text(0.06, p_y, txt,
+                                  fontsize=MATH_FS - 2, color='#444444',
+                                  va='top', ha='left', fontfamily='monospace', usetex=False)
+                    p_y -= MATH_H
+                else:
+                    display = re.sub(r'\*\*?([^*]+)\*\*?', r'\1', txt)
+                    display = re.sub(r'__?([^_]+)__?', r'\1', display)
+                    is_heading = bool(re.match(r'Step\s+\d+', txt.strip())
+                                      or re.match(r'Problem\s+\d+', txt.strip()))
+                    wrapped_lines = textwrap.wrap(display, width=WRAP_WIDTH) or [display]
+                    p_ax.text(0.03, p_y, '\n'.join(wrapped_lines),
+                              fontsize=PROSE_FS,
+                              color='#1a1a2e' if is_heading else '#222222',
+                              fontweight='bold' if is_heading else 'normal',
+                              va='top', ha='left', usetex=False)
+                    p_y -= LINE_H * len(wrapped_lines)
+            p_fig.tight_layout(pad=0.3)
+            p_path = os.path.join(PLOT_FOLDER, f'response_{msg_id}_p{pi}.png')
+            p_fig.savefig(p_path, dpi=200, bbox_inches='tight',
+                          facecolor='white', edgecolor='none')
+            plt.close('all')
+            render_response_png._extra_pages.append(p_path)
+
+        rows = pages[0]
+        total_h = max(8.0, sum(
+            MATH_H if k == 'math'
+            else LINE_H * max(1, len(textwrap.wrap(t, width=WRAP_WIDTH)) if t.strip() else 1)
+            for k, t in rows
+        ) + TITLE_H + PAD)
+    else:
+        render_response_png._extra_pages = []
+
+    
     fig, ax = plt.subplots(figsize=(FIG_W, total_h), facecolor='white')
     ax.set_facecolor('white')
     ax.axis('off')
@@ -539,7 +628,7 @@ def render_response_png(llm_text: str, title: str, msg_id: int) -> str | None:
 
     fig.tight_layout(pad=0.3)
     path = os.path.join(PLOT_FOLDER, f'response_{msg_id}.png')
-    fig.savefig(path, dpi=160, bbox_inches='tight',
+    fig.savefig(path, dpi=200, bbox_inches='tight',
                 facecolor='white', edgecolor='none')
     plt.close('all')
     return path
@@ -590,6 +679,9 @@ async def send_llm_response(update: Update, response_text: str,
         if png and os.path.exists(png):
             success = await _send_photo_with_retry(update, png, title)
             if success:
+                for extra in getattr(render_response_png, '_extra_pages', []):
+                    if os.path.exists(extra):
+                        await _send_photo_with_retry(update, extra, f"{title} (cont.)")
                 return
             # All retries exhausted — fall through to plain text
             print(f"[send_llm_response] photo send failed after retries, "
