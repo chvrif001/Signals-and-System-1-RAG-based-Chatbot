@@ -578,8 +578,12 @@ def _build_convolution_steps(expr1_str: str, expr2_str: str,
         limits = (tau, lower, upper)
         lower_tex = _sympy_to_latex(lower)
         upper_tex = _sympy_to_latex(upper)
+        steps.append(("Limits",
+                       rf"\tau \in [{lower_tex},\; {upper_tex}] "
+                       rf"\text{{ (from Heaviside support)}}"))
     else:
         limits = (tau, -sp.oo, sp.oo)
+        steps.append(("Limits", r"\tau \in (-\infty, \infty)"))
 
     try:
         result = sp.integrate(integrand, limits)
