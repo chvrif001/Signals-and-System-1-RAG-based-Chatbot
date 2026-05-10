@@ -62,7 +62,7 @@ os.makedirs(PLOT_FOLDER, exist_ok=True)
 os.environ["TOGETHER_API_KEY"] = TOGETHER_API_KEY
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FIX 2 — SAFE REPLY WRAPPER (retry on ConnectTimeout / TimedOut)
+# SAFE REPLY WRAPPER (retry on ConnectTimeout / TimedOut)
 # ══════════════════════════════════════════════════════════════════════════════
 async def _safe_reply(update: Update, text: str,
                       parse_mode: str | None = None,
@@ -677,7 +677,7 @@ def _build_laplace_steps(expr_str: str) -> tuple[list[tuple[str, str]], str]:
         return [], f"❌ Could not compute Laplace transform: {e}"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ★ INVERSE LAPLACE STEP BUILDER (NEW)
+# INVERSE LAPLACE STEP BUILDER
 # ══════════════════════════════════════════════════════════════════════════════
 def _identify_inv_laplace_rule_latex(expr: sp.Expr) -> str:
     s = str(expr)
@@ -694,10 +694,8 @@ def _identify_inv_laplace_rule_latex(expr: sp.Expr) -> str:
     return r"\text{Partial fractions / Bromwich integral}"
 
 def _build_inv_laplace_steps(expr_str: str) -> tuple[list[tuple[str, str]], str]:
-    """Build step-by-step inverse Laplace transform."""
     steps: list[tuple[str, str]] = []
     try:
-        # Parse as expression in s
         F = sp.sympify(_normalise(expr_str), locals={
             **_COMMON_NS, "s": s_sym, "t": t_sym
         })
@@ -709,7 +707,6 @@ def _build_inv_laplace_steps(expr_str: str) -> tuple[list[tuple[str, str]], str]
                        r"\frac{1}{2\pi j}\int_{c-j\infty}^{c+j\infty} F(s)\,e^{st}\,ds"))
         steps.append(("Rule / Form", _identify_inv_laplace_rule_latex(F)))
 
-        # Attempt partial fraction decomposition
         try:
             pf = sp.apart(F, s_sym)
             if pf != F:
@@ -718,11 +715,9 @@ def _build_inv_laplace_steps(expr_str: str) -> tuple[list[tuple[str, str]], str]
         except Exception:
             pass
 
-        # Compute inverse Laplace via SymPy
         result = sp.inverse_laplace_transform(F, s_sym, t_sym)
         result = sp.simplify(result)
 
-        # Clean up Heaviside notation
         result_tex = _sympy_to_latex(result)
         result_tex = result_tex.replace(r"\theta\left(t\right)", r"u(t)")
         result_tex = re.sub(r'\\theta\(t\)', r'u(t)', result_tex)
@@ -827,7 +822,7 @@ def _build_fourier_steps(expr_str: str) -> tuple[list[tuple[str, str]], str]:
         return [], f"❌ Could not compute Fourier transform: {e}"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ★ INVERSE FOURIER STEP BUILDER (NEW)
+# INVERSE FOURIER STEP BUILDER
 # ══════════════════════════════════════════════════════════════════════════════
 def _identify_inv_fourier_rule_latex(expr: sp.Expr) -> str:
     s = str(expr)
@@ -840,10 +835,8 @@ def _identify_inv_fourier_rule_latex(expr: sp.Expr) -> str:
     return r"f(t) = \frac{1}{2\pi}\int_{-\infty}^{\infty} F(\omega)\,e^{j\omega t}\,d\omega"
 
 def _build_inv_fourier_steps(expr_str: str) -> tuple[list[tuple[str, str]], str]:
-    """Build step-by-step inverse Fourier transform."""
     steps: list[tuple[str, str]] = []
     try:
-        # Parse as expression in omega
         F = sp.sympify(_normalise(expr_str), locals={
             **_COMMON_NS, "omega": w_sym, "w": w_sym
         })
@@ -855,7 +848,6 @@ def _build_inv_fourier_steps(expr_str: str) -> tuple[list[tuple[str, str]], str]
                        r"F(\omega)\,e^{j\omega t}\,d\omega"))
         steps.append(("Rule / Form", _identify_inv_fourier_rule_latex(F)))
 
-        # Attempt partial fractions in omega
         try:
             pf = sp.apart(F, w_sym)
             if pf != F:
@@ -864,15 +856,11 @@ def _build_inv_fourier_steps(expr_str: str) -> tuple[list[tuple[str, str]], str]
         except Exception:
             pass
 
-        # Compute inverse Fourier via SymPy
-        # SymPy's inverse_fourier_transform uses convention F(f) not F(omega)
-        # We use the integral directly for the omega convention
         result = sp.integrate(
             F * sp.exp(sp.I * w_sym * t_sym) / (2 * sp.pi),
             (w_sym, -sp.oo, sp.oo)
         )
         if result.has(sp.Integral):
-            # Fallback: try SymPy's built-in (different convention, rescale)
             result = sp.inverse_fourier_transform(
                 F.subs(w_sym, 2 * sp.pi * sp.Symbol('f')),
                 sp.Symbol('f'), t_sym
@@ -880,7 +868,6 @@ def _build_inv_fourier_steps(expr_str: str) -> tuple[list[tuple[str, str]], str]
 
         result = sp.simplify(result)
         result_tex = _sympy_to_latex(result)
-        # Fix imaginary unit notation
         result_tex = re.sub(r'(?<![a-zA-Z])i(?![a-zA-Z])', 'j', result_tex)
 
         steps.append(("Result", rf"f(t) = {result_tex}"))
@@ -1715,6 +1702,19 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown")
 
 # ══════════════════════════════════════════════════════════════════════════════
+# PERIOD EXTRACTOR
+# ══════════════════════════════════════════════════════════════════════════════
+def _extract_period(text: str) -> float | None:
+    m = re.search(r'[Tt]\s*=\s*([0-9.]+\s*\*?\s*pi|[0-9.]+)', text)
+    if not m:
+        return None
+    raw = m.group(1).replace(" ", "")
+    if "pi" in raw:
+        num = raw.replace("pi", "").replace("*", "") or "1"
+        return float(num) * float(np.pi)
+    return float(raw)
+
+# ══════════════════════════════════════════════════════════════════════════════
 # TEXT HANDLER
 # ══════════════════════════════════════════════════════════════════════════════
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1730,7 +1730,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── 2. Session-based document Q&A ─────────────────────────────────────────
     if session_has(chat_id):
         sess = session_get(chat_id)
-        # FIX 3: acknowledge immediately
         await _safe_reply(update,
             f"⏳ Working on it using *{sess['source']}* as reference…",
             parse_mode="Markdown")
@@ -1755,7 +1754,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── 3. Math tools ─────────────────────────────────────────────────────────
 
-    # ── Inverse Laplace (NEW) ─────────────────────────────────────────────────
+    # ── Inverse Laplace ───────────────────────────────────────────────────────
     if is_inv_laplace(q_lower):
         expr_str = extract_expr(question)
         if not expr_str:
@@ -1764,7 +1763,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "  _inverse laplace of 1/(s+2)_\n"
                 "  _ilt of s/(s^2+4)_", parse_mode="Markdown")
             return
-        # FIX 3: immediate acknowledgement before heavy computation
         await _safe_reply(update, "⏳ Computing Inverse Laplace transform…")
         steps, err = _build_inv_laplace_steps(expr_str)
         if err:
@@ -1780,7 +1778,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await send_long_code(update, compute_inv_laplace(expr_str))
         return
 
-    # ── Inverse Fourier (NEW) ─────────────────────────────────────────────────
+    # ── Inverse Fourier ───────────────────────────────────────────────────────
     if is_inv_fourier(q_lower):
         expr_str = extract_expr(question)
         if not expr_str:
@@ -1952,7 +1950,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not qa_chain:
         await _safe_reply(update, "⚠️ No knowledge base loaded.")
         return
-    # FIX 3: acknowledge before LLM call
     await _safe_reply(update, "🤔 Thinking…")
     try:
         answer = qa_chain.invoke(question)
@@ -1968,7 +1965,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     msg_id  = update.message.message_id
 
-    # FIX 3: acknowledge immediately before OCR
     await _safe_reply(update,
         "📷 Got your photo — running OCR… (~15–30s)")
 
@@ -2128,7 +2124,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⚠️ Unsupported file type. Please send a PDF or image (PNG, JPG, WEBP).")
         return
 
-    # FIX 3: acknowledge before downloading
     await _safe_reply(update,
         f"📄 Received *{file_name}* — extracting content…",
         parse_mode="Markdown")
@@ -2175,24 +2170,21 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _safe_reply(update, "_(Session cleared.)_", parse_mode="Markdown")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PERIOD EXTRACTOR (used by multiple handlers)
-# ══════════════════════════════════════════════════════════════════════════════
-def _extract_period(text: str) -> float | None:
-    m = re.search(r'[Tt]\s*=\s*([0-9.]+\s*\*?\s*pi|[0-9.]+)', text)
-    if not m:
-        return None
-    raw = m.group(1).replace(" ", "")
-    if "pi" in raw:
-        num = raw.replace("pi", "").replace("*", "") or "1"
-        return float(num) * float(np.pi)
-    return float(raw)
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MAIN  — FIX 1: increased timeouts in HTTPXRequest
+# MAIN  ← only this function was changed (fixed HTTPXRequest conflict)
 # ══════════════════════════════════════════════════════════════════════════════
 async def main():
-    # FIX 1 — raise all timeouts from default 5s to 30s
+    # Two separate HTTPXRequest instances — one for regular API calls,
+    # one for get_updates — both with raised timeouts.
+    # You CANNOT mix .request()/.get_updates_request() with
+    # .http_version()/.get_updates_http_version() — they are mutually exclusive.
     req = tg_request.HTTPXRequest(
+        connection_pool_size=8,
+        connect_timeout=30.0,
+        read_timeout=30.0,
+        write_timeout=30.0,
+        pool_timeout=30.0,
+    )
+    req_updates = tg_request.HTTPXRequest(
         connection_pool_size=8,
         connect_timeout=30.0,
         read_timeout=30.0,
@@ -2204,8 +2196,7 @@ async def main():
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .request(req)
-        .get_updates_http_version("1.1")
-        .http_version("1.1")
+        .get_updates_request(req_updates)
         .build()
     )
 
