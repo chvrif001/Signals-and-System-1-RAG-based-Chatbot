@@ -1664,24 +1664,21 @@ async def send_long_code(update: Update, text: str) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _safe_reply(update,
-        "👋 Hi! I'm your *Signals & Systems* tutor bot.\n\n"
-        "📐 *Laplace Transform*       — _laplace of e^(-2t)*u(t)_\n"
-        "📐 *Inverse Laplace*         — _inverse laplace of 1/(s+2)_\n"
-        "📡 *Fourier Transform*       — _fourier transform of e^(-t)*u(t)_\n"
-        "📡 *Inverse Fourier*         — _inverse fourier of 1/(1+j*omega)_\n"
-        "📡 *Periodic Fourier*        — _fourier transform of x(t)=sum g(t-2k), g(t)=e^(-t)*u(t), T=2_\n"
-        "🎵 *Fourier Series*          — _fourier series of t, T=2_\n"
-        "🔁 *Convolution*             — _convolve u(t) with e^(-t)*u(t)_\n"
-        "📊 *Plot signals*            — _plot 2*u(t-2)_  or  _draw u[n]-u[n-3]_\n"
-        "📷 *Upload a photo*          — handwritten work or question image\n"
-        "📄 *Upload PDF/image file*   — memo, question paper, textbook\n"
-        "🧮 *Mark calculator*         — _how much do I need to pass_\n\n"
+         "👋 Hi there! I'm your *Signals & Systems 1* tutor bot.\n\n"
+        "I am here to help you understand any Signals and Systems 1 topic that you may be struggling in, or need clarification in. Feel free to ask me any Signals and Systems 1 related questions. I can help you with the following calculations: \n"
+        "📡 *Laplace Transforms*\n" 
+        "📡 *Inverse Laplace Transforms*\n"
+        "📡 *Fourier Transform*\n"
+        "📡 *Inverse Fourier Transforms*\n"
+        "📡 *Convolution*\n"
+        "📊 *Plot signals*\n\n"
+        "I can also help you calculate how much you need in your exam to pass the course. Ask me anything, I am here for you. Do not suffer while I am here.\n"
         "Use /help for the full guide.",
         parse_mode="Markdown")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _safe_reply(update,
-        "🆘 *Full guide:*\n\n"
+        "👋*Full guide:*\n\n"
         "1. *Laplace*           _laplace of e^(-2*t)*u(t)_\n"
         "2. *Inverse Laplace*   _inverse laplace of 1/(s+2)_\n"
         "   Also: _ilt of s/(s^2+4)_\n"
